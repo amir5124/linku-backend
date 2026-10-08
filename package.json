@@ -33,6 +33,7 @@
     "@types/node": "^22.5.0",
     "@types/node-cron": "^3.0.11",
     "@types/ws": "^8.18.1",
+    "tsc-alias": "^1.9.7",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4"
   }
