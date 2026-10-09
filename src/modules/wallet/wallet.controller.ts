@@ -69,7 +69,7 @@ export const walletController = {
     topupInquiry: asyncHandler(async (req: Request, res: Response) => {
         const { amount, method, bank_code } = req.body;
 
-        if (!amount || Number(amount) < 10000)
+        if (!amount || Number(amount) < 100)
             throw ApiError.badRequest('Minimal topup Rp10.000');
         if (method !== 'va' && method !== 'qris')
             throw ApiError.badRequest("Method harus 'va' atau 'qris'");

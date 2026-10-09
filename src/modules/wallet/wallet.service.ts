@@ -450,7 +450,7 @@ class WalletService {
     }) {
         console.log('🚀 [topupInquiry] START', { userId, dto });
 
-        if (dto.amount < 10000) {
+        if (dto.amount < 100) {
             throw ApiError.badRequest('Minimal topup Rp10.000');
         }
 
