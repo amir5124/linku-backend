@@ -76,7 +76,7 @@ app.use(errorHandler);
 const httpServer = createServer(app);
 initSocket(httpServer);
 
-startJobs();
+// startJobs();
 
 // Cek order pending tiap 1 menit
 orderTimeoutService.start(60_000);

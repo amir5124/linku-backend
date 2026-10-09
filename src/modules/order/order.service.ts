@@ -5,6 +5,19 @@ import { notificationService } from '../notification/notification.service';
 import { logger } from '../../config/logger';
 
 // ============================================================
+// RINGKASAN PERBAIKAN (cari tanda [FIX] di bawah)
+// 1. Potongan admin 5% dihapus: driver_earning = ongkir penuh,
+//    platform hanya mengambil komisi saat settleOrder.
+// 2. Jarak dari klien tidak dipercaya begitu saja: dipakai nilai
+//    terbesar antara jarak dari klien dan jarak garis lurus.
+// 3. calculate_fare (cadangan) dicek error-nya, tidak lagi
+//    diam-diam menghasilkan ongkir Rp 0.
+// 4. updateStatus memakai kunci status (optimistic lock) supaya
+//    dua permintaan bersamaan tidak lolos dua-duanya (mis. dobel
+//    "completed" yang memicu settle ganda).
+// ============================================================
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -105,6 +118,30 @@ function prettyPlace(name: string | null | undefined): string {
     return cleaned[0] ?? name;
 }
 
+/**
+ * [FIX] Jarak garis lurus (km) antara dua koordinat.
+ * Dipakai sebagai batas bawah jarak order: jarak lewat jalan tidak
+ * pernah lebih pendek dari garis lurus, jadi klien tidak bisa
+ * menekan ongkir dengan mengirim distance_km yang dikecilkan.
+ */
+function haversineKm(
+    lat1: number,
+    lng1: number,
+    lat2: number,
+    lng2: number
+): number {
+    const R = 6371;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) *
+        Math.cos(toRad(lat2)) *
+        Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 // ============================================================
 // Service
 // ============================================================
@@ -121,6 +158,37 @@ export const orderService = {
             paymentMethod: input.payment_method,
         });
 
+        // ═══════════════════════════════════════════════════════════
+        // [FIX] JARAK AMAN: ambil yang terbesar antara jarak dari klien
+        // dan jarak garis lurus pickup → dropoff
+        // ═══════════════════════════════════════════════════════════
+        const reportedKm = Number(input.distance_km);
+        const straightKm = haversineKm(
+            Number(input.pickup_lat),
+            Number(input.pickup_lng),
+            Number(input.dropoff_lat),
+            Number(input.dropoff_lng)
+        );
+        const safeReportedKm = Number.isFinite(reportedKm) ? reportedKm : 0;
+        const safeStraightKm = Number.isFinite(straightKm) ? straightKm : 0;
+        const distanceKm =
+            Math.round(Math.max(safeReportedKm, safeStraightKm) * 1000) / 1000;
+
+        if (!(distanceKm > 0)) {
+            throw ApiError.badRequest('Jarak perjalanan tidak valid');
+        }
+        if (safeReportedKm + 0.1 < safeStraightKm) {
+            logger.warn(
+                '[order.create] distance_km dari klien lebih kecil dari jarak garis lurus, dikoreksi',
+                {
+                    customerId,
+                    reportedKm: safeReportedKm,
+                    straightKm: safeStraightKm,
+                    usedKm: distanceKm,
+                }
+            );
+        }
+
         let delivery_fee = 0;
         let admin_fee = 0;
         let driver_earning = 0;
@@ -136,7 +204,7 @@ export const orderService = {
                 'calculate_tariff',
                 {
                     p_code: input.tariff_code,
-                    p_distance_km: input.distance_km,
+                    p_distance_km: distanceKm, // [FIX]
                 }
             );
 
@@ -155,23 +223,44 @@ export const orderService = {
                 );
             }
 
+            // [FIX] Tidak ada potongan admin. Driver menerima ongkir penuh;
+            // satu-satunya potongan adalah komisi yang dihitung saat settleOrder.
             delivery_fee = row.price ?? 0;
-            admin_fee = Math.round(delivery_fee * 0.05);
-            driver_earning = delivery_fee - admin_fee;
-            platform_earning = admin_fee;
+            admin_fee = 0;
+            driver_earning = delivery_fee;
+            platform_earning = 0; // diisi komisi saat settleOrder
             tariffCode = row.code ?? input.tariff_code;
             tariffLabel = row.label ?? input.option_name ?? null;
         } else {
-            const { data: fare } = await supabaseAdmin.rpc('calculate_fare', {
-                p_distance_km: input.distance_km,
-                p_type: input.type,
-                p_is_peak_hour: false,
-            });
+            // Cadangan bila order tidak membawa tariff_code
+            const { data: fare, error: fErr } = await supabaseAdmin.rpc(
+                'calculate_fare',
+                {
+                    p_distance_km: distanceKm, // [FIX]
+                    p_type: input.type,
+                    p_is_peak_hour: false,
+                }
+            );
+
+            // [FIX] Jangan diam-diam menghasilkan ongkir Rp 0 bila gagal
+            if (fErr) {
+                logger.error('[order.create] calculate_fare gagal', {
+                    error: fErr.message,
+                    type: input.type,
+                });
+                throw ApiError.internal(fErr.message);
+            }
+
             const fareRow = Array.isArray(fare) ? fare[0] : fare;
-            delivery_fee = fareRow?.delivery_fee ?? 0;
-            admin_fee = fareRow?.admin_fee ?? 0;
-            driver_earning = fareRow?.driver_earning ?? 0;
-            platform_earning = admin_fee;
+            if (!fareRow || !(Number(fareRow.delivery_fee) > 0)) {
+                throw ApiError.badRequest('Tarif tidak dapat dihitung');
+            }
+
+            // [FIX] Tanpa potongan admin (abaikan admin_fee dari function)
+            delivery_fee = Number(fareRow.delivery_fee);
+            admin_fee = 0;
+            driver_earning = delivery_fee;
+            platform_earning = 0;
         }
 
         logger.info('[order.create] Tarif dihitung', {
@@ -179,6 +268,7 @@ export const orderService = {
             admin_fee,
             driver_earning,
             platform_earning,
+            distanceKm,
         });
 
         // ═══════════════════════════════════════════════════════════
@@ -262,7 +352,7 @@ export const orderService = {
                 dropoff_name: input.dropoff_name,
                 dropoff_address: input.dropoff_address,
                 dropoff_location: `POINT(${input.dropoff_lng} ${input.dropoff_lat})`,
-                distance_km: input.distance_km,
+                distance_km: distanceKm, // [FIX]
                 duration_min: input.duration_min,
                 subtotal,
                 delivery_fee,
@@ -566,9 +656,9 @@ export const orderService = {
         const pickupShort = prettyPlace(input.pickup_name);
         const dropoffShort = prettyPlace(input.dropoff_name);
         const jarakText =
-            input.distance_km < 1
-                ? `${Math.round(input.distance_km * 1000)} m`
-                : `${input.distance_km.toFixed(1)} km`;
+            distanceKm < 1
+                ? `${Math.round(distanceKm * 1000)} m`
+                : `${distanceKm.toFixed(1)} km`; // [FIX]
         const fareText = `Rp${Number(delivery_fee).toLocaleString('id-ID')}`;
 
         // ═══════════════════════════════════════════════════════════
@@ -724,6 +814,9 @@ export const orderService = {
 
         // ═══════════════════════════════════════════════════════════
         // ✅ NOTIF khusus untuk QRIS/VA — kirim ke customer
+        // (catatan: untuk QRIS/VA fungsi sudah return lebih awal di
+        //  bagian payment, jadi blok ini tidak terjangkau; dibiarkan
+        //  seperti aslinya agar perilaku tidak berubah)
         // ═══════════════════════════════════════════════════════════
         if (
             (paymentMethod === 'qris' || paymentMethod === 'bank_transfer') &&
@@ -762,6 +855,7 @@ export const orderService = {
 
         return await orderService.getById(order.id, customerId, 'customer');
     },
+
     // ============================================================
     // ACCEPT ORDER (driver)
     // ============================================================
@@ -916,7 +1010,6 @@ export const orderService = {
 
         return data;
     },
-
 
     /**
      * Trigger matching driver setelah payment paid (QRIS/VA).
@@ -1277,13 +1370,28 @@ export const orderService = {
             patch.cancellation_reason = reason;
         }
 
+        // [FIX] Kunci status (optimistic lock): update hanya berhasil bila
+        // status order masih sama dengan yang tadi dibaca. Permintaan kedua
+        // yang datang bersamaan akan ditolak, bukan ikut lolos (mencegah
+        // dobel completed → dobel settle).
         const { data, error } = await supabaseAdmin
             .from('orders')
             .update(patch)
             .eq('id', orderId)
+            .eq('status', order.status)
             .select()
-            .single();
+            .maybeSingle();
         if (error) throw ApiError.internal(error.message);
+        if (!data) {
+            logger.warn('[order.updateStatus] Status sudah berubah (race)', {
+                orderId,
+                expectedFrom: order.status,
+                to: status,
+            });
+            throw ApiError.conflict(
+                'Status order sudah berubah, muat ulang lalu coba lagi'
+            );
+        }
 
         logger.info('[order.updateStatus] Status updated', {
             orderId,

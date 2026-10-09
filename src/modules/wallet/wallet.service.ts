@@ -1119,8 +1119,7 @@ class WalletService {
         const customerEmail = profile?.email ?? 'noreply@warung.id';
 
         const partnerReff = `ORDER-${input.orderId}-${Date.now()}`;
-        // wallet.service.ts — createOrderPayment
-        const expired = this.generateExpiredTimestamp(15); // ⬅️ dari 30 → 15
+        const expired = this.generateExpiredTimestamp(15);
 
         let endpoint = '';
         let payload: any = {};
@@ -1178,6 +1177,8 @@ class WalletService {
 
         // 2. Request ke LinkQu
         const url = `${LINKQU_CONFIG.baseUrl}${endpoint}`;
+        console.log('📤 [createOrderPayment] REQUEST', { url, payload });
+
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -1191,7 +1192,17 @@ class WalletService {
             body: JSON.stringify(payload),
         });
 
+        // ✅ BACA RAW DULU
         const rawText = await response.text();
+        console.log('📥 [createOrderPayment] HTTP', response.status);
+        console.log('📥 [createOrderPayment] RAW', rawText);
+
+        if (!response.ok) {
+            throw ApiError.internal(
+                `LinkQu error ${response.status}: ${rawText.slice(0, 200)}`
+            );
+        }
+
         let data: any;
         try {
             data = JSON.parse(rawText);
@@ -1199,11 +1210,57 @@ class WalletService {
             throw ApiError.internal('Response LinkQu tidak valid');
         }
 
-        if (!response.ok) {
-            throw ApiError.internal(`LinkQu error ${response.status}`);
+        console.log(
+            '✅ [createOrderPayment] PARSED',
+            JSON.stringify(data, null, 2)
+        );
+
+        // ═══════════════════════════════════════════════════════════
+        // ✅ PARSE VA NUMBER & QR URL DARI BERBAGAI BENTUK RESPONSE
+        // ═══════════════════════════════════════════════════════════
+        const vaNumber =
+            data?.data?.virtual_account ??
+            data?.virtual_account ??
+            data?.data?.va_number ??
+            data?.va_number ??
+            data?.data?.vaNumber ??
+            data?.vaNumber ??
+            null;
+
+        const qrUrl =
+            data?.data?.imageqris ??
+            data?.imageqris ??
+            data?.data?.qr_url ??
+            data?.qr_url ??
+            data?.data?.qris_url ??
+            data?.qris_url ??
+            null;
+
+        const expiredFromLinkqu =
+            data?.data?.expired ??
+            data?.expired ??
+            data?.data?.expired_at ??
+            data?.expired_at ??
+            null;
+
+        console.log('📋 [createOrderPayment] Parsed:', {
+            vaNumber,
+            qrUrl,
+            expiredFromLinkqu,
+            method: input.method,
+        });
+
+        // ⚠️ Kalau VA method tapi VA number kosong, log warning
+        if (input.method === 'va' && !vaNumber) {
+            console.error(
+                '❌ [createOrderPayment] LinkQu TIDAK mengembalikan va_number! Full response:',
+                JSON.stringify(data, null, 2)
+            );
         }
 
         // 3. Simpan ke DB
+        const expiredAt = this.parseExpiredToDate(expired);
+
         await supabaseAdmin.from('order_payments').insert({
             order_id: input.orderId,
             user_id: input.userId,
@@ -1211,22 +1268,21 @@ class WalletService {
             method: input.method,
             amount: input.amount,
             bank_code: input.bankCode ?? null,
-            va_number: data?.virtual_account ?? null,
-            qr_url: data?.imageqris ?? null,
+            va_number: vaNumber,
+            qr_url: qrUrl,
             status: 'PENDING',
             raw_response: data,
-            expired_at: this.parseExpiredToDate(expired),
+            expired_at: expiredAt,
         });
 
         return {
             ...data,
             partner_reff: partnerReff,
-            va_number: data?.virtual_account ?? null,
-            qr_url: data?.imageqris ?? null,
-            expired_at: this.parseExpiredToDate(expired),
+            va_number: vaNumber,        // ✅ hasil parse lengkap
+            qr_url: qrUrl,              // ✅ hasil parse lengkap
+            expired_at: expiredAt,
         };
     }
-
     // Di wallet.service.ts
     async payWithWallet(userId: string, orderId: number, amount: number) {
         logger.info('[wallet.payWithWallet] START', { userId, orderId, amount });
