@@ -17,11 +17,13 @@ export const walletController = {
     // GET /api/wallet
     // ============================================================
     getWallet: asyncHandler(async (req: Request, res: Response) => {
-        const data = req.user?.role === 'driver'
-            ? await walletService.getWallet(req.user!.id, 'driver')
-            : await walletService.getWallet(req.user!.id, 'customer');
+        const data =
+            req.user?.role === 'driver'
+                ? await walletService.getWallet(req.user!.id, 'driver')
+                : await walletService.getWallet(req.user!.id, 'customer');
         return ok(res, data);
     }),
+
     // ============================================================
     // GET /api/wallet/ledger
     // ============================================================
@@ -30,9 +32,14 @@ export const walletController = {
         const offset = Number(req.query.offset ?? 0);
         const role = resolveWalletRole(req);
 
-        const data = role === 'driver'
-            ? await walletService.listLedger(req.user!.id, limit, offset)
-            : await walletService.listLedgerCustomer(req.user!.id, limit, offset);
+        const data =
+            role === 'driver'
+                ? await walletService.listLedger(req.user!.id, limit, offset)
+                : await walletService.listLedgerCustomer(
+                    req.user!.id,
+                    limit,
+                    offset
+                );
 
         return ok(res, data);
     }),
@@ -49,9 +56,16 @@ export const walletController = {
     // POST /api/wallet/payouts (driver only)
     // ============================================================
     requestPayout: asyncHandler(async (req: Request, res: Response) => {
-        const { amount, bank_code, bank_name, account_number, account_name } = req.body;
+        const {
+            amount,
+            bank_code,
+            bank_name,
+            account_number,
+            account_name,
+        } = req.body;
 
-        if (!amount || amount <= 0) throw ApiError.badRequest('Jumlah tidak valid');
+        if (!amount || amount <= 0)
+            throw ApiError.badRequest('Jumlah tidak valid');
         if (!bank_code || !account_number || !account_name)
             throw ApiError.badRequest('Info bank tidak lengkap');
 
@@ -91,7 +105,10 @@ export const walletController = {
         const { partner_reff } = req.body;
         if (!partner_reff) throw ApiError.badRequest('partner_reff wajib');
 
-        const data = await walletService.topupExecute(req.user!.id, partner_reff);
+        const data = await walletService.topupExecute(
+            req.user!.id,
+            partner_reff
+        );
         return ok(res, data, 'Status topup diperbarui');
     }),
 
@@ -167,9 +184,62 @@ export const walletController = {
 
     deleteAccount: asyncHandler(async (req: Request, res: Response) => {
         const id = Number(req.params.id);
-        if (!id || Number.isNaN(id)) throw ApiError.badRequest('ID tidak valid');
+        if (!id || Number.isNaN(id))
+            throw ApiError.badRequest('ID tidak valid');
 
         await walletService.deleteAccount(req.user!.id, id);
         return ok(res, null, 'Rekening dihapus');
+    }),
+
+    // ============================================================
+    // ✅ HISTORY TOPUP
+    // GET /api/wallet/topups?limit=20&offset=0&status=SUCCESS
+    // ============================================================
+    listTopups: asyncHandler(async (req: Request, res: Response) => {
+        const limit = Number(req.query.limit ?? 20);
+        const offset = Number(req.query.offset ?? 0);
+        const status = req.query.status as string | undefined;
+
+        const data = await walletService.listTopups(
+            req.user!.id,
+            limit,
+            offset,
+            status
+        );
+        return ok(res, data, 'Topup history');
+    }),
+
+    // ============================================================
+    // ✅ HISTORY WITHDRAWAL
+    // GET /api/wallet/withdrawals?limit=20&offset=0&status=SUCCESS
+    // ============================================================
+    listWithdrawals: asyncHandler(async (req: Request, res: Response) => {
+        const limit = Number(req.query.limit ?? 20);
+        const offset = Number(req.query.offset ?? 0);
+        const status = req.query.status as string | undefined;
+
+        const data = await walletService.listWithdrawals(
+            req.user!.id,
+            limit,
+            offset,
+            status
+        );
+        return ok(res, data, 'Withdraw history');
+    }),
+
+    // ============================================================
+    // ✅ HISTORY TRANSACTIONS (gabungan)
+    // GET /api/wallet/transactions?limit=20&offset=0
+    // ============================================================
+    listTransactions: asyncHandler(async (req: Request, res: Response) => {
+        const limit = Number(req.query.limit ?? 20);
+        const offset = Number(req.query.offset ?? 0);
+
+        const data = await walletService.listTransactions(
+            req.user!.id,
+            limit,
+            offset
+        );
+        return ok(res, data, 'Transaction history');
     }),
 };

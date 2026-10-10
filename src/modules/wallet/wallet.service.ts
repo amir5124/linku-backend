@@ -1098,6 +1098,173 @@ class WalletService {
         }
     }
 
+    // ============================================================
+    // LIST TOPUPS — history topup user
+    // ============================================================
+    async listTopups(
+        userId: string,
+        limit = 20,
+        offset = 0,
+        status?: string
+    ) {
+        let query = supabaseAdmin
+            .from('wallet_topups')
+            .select('*', { count: 'exact' })
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (status) {
+            query = query.eq('status', status);
+        }
+
+        const { data, error, count } = await query;
+
+        if (error) {
+            logger.error('Gagal ambil list topups', {
+                error: error.message,
+                userId,
+            });
+            throw ApiError.internal('Gagal ambil history topup');
+        }
+
+        return {
+            items: data ?? [],
+            total: count ?? 0,
+            limit,
+            offset,
+        };
+    }
+
+    // ============================================================
+    // LIST WITHDRAWALS — history withdraw user
+    // ============================================================
+    async listWithdrawals(
+        userId: string,
+        limit = 20,
+        offset = 0,
+        status?: string
+    ) {
+        let query = supabaseAdmin
+            .from('wallet_withdrawals')
+            .select('*', { count: 'exact' })
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (status) {
+            query = query.eq('status', status);
+        }
+
+        const { data, error, count } = await query;
+
+        if (error) {
+            logger.error('Gagal ambil list withdrawals', {
+                error: error.message,
+                userId,
+            });
+            throw ApiError.internal('Gagal ambil history withdraw');
+        }
+
+        return {
+            items: data ?? [],
+            total: count ?? 0,
+            limit,
+            offset,
+        };
+    }
+
+    // ============================================================
+    // LIST TRANSACTIONS — gabungan topup + withdraw + order payment
+    // Untuk halaman "Riwayat Transaksi"
+    // ============================================================
+    async listTransactions(
+        userId: string,
+        limit = 20,
+        offset = 0
+    ) {
+        // Ambil topups
+        const { data: topups } = await supabaseAdmin
+            .from('wallet_topups')
+            .select('id, partner_reff, method, amount, nominal, admin_fee, status, created_at, va_number, qris_url')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Ambil withdrawals
+        const { data: withdrawals } = await supabaseAdmin
+            .from('wallet_withdrawals')
+            .select('id, inquiry_reff, partner_reff, bank_code, account_number, amount, fee_admin, status, created_at')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Ambil wallet transactions (order payment, refund, dll)
+        const { data: transactions } = await supabaseAdmin
+            .from('wallet_transactions')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Gabung & normalisasi
+        const items = [
+            ...(topups ?? []).map((t) => ({
+                id: `topup-${t.id}`,
+                type: 'topup' as const,
+                amount: Number(t.nominal ?? t.amount),
+                total_amount: Number(t.amount),
+                admin_fee: Number(t.admin_fee ?? 0),
+                method: t.method ?? 'va',
+                status: t.status,
+                reference: t.partner_reff,
+                va_number: t.va_number,
+                qris_url: t.qris_url,
+                created_at: t.created_at,
+                description: `Topup via ${t.method?.toUpperCase() ?? 'LinkQu'}`,
+            })),
+            ...(withdrawals ?? []).map((w) => ({
+                id: `withdraw-${w.id}`,
+                type: 'withdraw' as const,
+                amount: Number(w.amount),
+                total_amount: Number(w.amount) + Number(w.fee_admin ?? 0),
+                admin_fee: Number(w.fee_admin ?? 0),
+                method: 'va',
+                status: w.status,
+                reference: w.partner_reff,
+                bank_code: w.bank_code,
+                account_number: w.account_number,
+                created_at: w.created_at,
+                description: `Withdraw ke ${w.bank_code} ${w.account_number}`,
+            })),
+            ...(transactions ?? []).map((t) => ({
+                id: `tx-${t.id}`,
+                type: t.type as any,
+                amount: Number(t.amount),
+                total_amount: Number(t.amount),
+                admin_fee: 0,
+                method: 'internal',
+                status: 'SUCCESS',
+                reference: t.reference_id,
+                created_at: t.created_at,
+                description: t.description,
+            })),
+        ];
+
+        // Sort by created_at DESC
+        items.sort(
+            (a, b) =>
+                new Date(b.created_at).getTime() -
+                new Date(a.created_at).getTime()
+        );
+
+        return {
+            items: items.slice(0, limit),
+            limit,
+            offset,
+        };
+    }
+
     // Di wallet.service.ts
     async createOrderPayment(input: {
         orderId: number;
