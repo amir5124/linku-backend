@@ -698,10 +698,15 @@ export const orderService = {
             total_fare: String(order.total_fare ?? 0),
             subtotal: String(order.subtotal ?? 0),
             payment_method: order.payment_method ?? 'cash',
-            payment_status: paymentMeta.status,           // ✅
-            payment_reference: paymentMeta.reference ?? null, // ✅
-            payment_url: paymentMeta.url ?? null,         // ✅
-            payment_expires_at: paymentMeta.expires_at ?? null, // ✅
+            payment_status: paymentMeta.status,
+            payment_reference: paymentMeta.reference ?? null,
+            payment_url: paymentMeta.url ?? null,
+            payment_expires_at: paymentMeta.expires_at ?? null,
+
+            // ⬇️⬇️⬇️ TAMBAH 1 BARIS INI ⬇️⬇️⬇️
+            accept_expires_at: order.accept_expires_at ?? null,
+            // ⬆️⬆️⬆️ TAMBAH 1 BARIS INI ⬆️⬆️⬆️
+
             tariff_code: order.tariff_code ?? '',
             option_name: order.option_name ?? '',
             customer_name: custProfile?.full_name ?? 'Customer',
@@ -717,7 +722,6 @@ export const orderService = {
             package_size: order.package_size ?? '',
             package_weight: order.package_weight ?? '',
         };
-
         // ═══════════════════════════════════════════════════════════
         // NOTIFIKASI
         // ═══════════════════════════════════════════════════════════
