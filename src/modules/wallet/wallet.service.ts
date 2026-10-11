@@ -71,6 +71,9 @@ type OrderRow = {
     commission_rate: number | null;
     platform_earning: number | null;
     settlement_type: string | null;
+    subtotal: number | null;          // ✅ FOOD
+    packaging_fee: number | null;     // ✅ FOOD
+    merchant_earning: number | null;  // ✅ FOOD
 };
 
 type WalletRow = {
@@ -184,12 +187,13 @@ class WalletService {
         const { data: orderRaw, error: oErr } = await supabaseAdmin
             .from('orders')
             .select(`
-            id, type, status, driver_id, customer_id,
-            delivery_fee, driver_earning, total_fare,
-            tariff_code, payment_method, payment_status,
-            settled_at, commission_amount, commission_rate,
-            platform_earning, settlement_type
-        `)
+                id, type, status, driver_id, customer_id,
+                delivery_fee, driver_earning, total_fare,
+                subtotal, packaging_fee, merchant_earning,
+                tariff_code, payment_method, payment_status,
+                settled_at, commission_amount, commission_rate,
+                platform_earning, settlement_type
+            `)
             .eq('id', orderId)
             .single();
 
@@ -213,17 +217,23 @@ class WalletService {
 
         // ────────────────────────────────────────────────────────
         // 3. Hitung komisi & driver earning
-        //    [FIX #1] basis = total_fare (bukan delivery_fee)
-        //    [FIX #2] driverEarning = total_fare - commissionAmount
+        //    ✅ FOOD: dasar komisi = delivery_fee (jasa antar driver).
+        //    Harga makanan (subtotal + packaging) bukan penghasilan driver,
+        //    jadi tidak boleh dipotong komisi.
+        //    ride / send: tetap total_fare.
         // ────────────────────────────────────────────────────────
+        const isFood = order.type === 'food';
+
         const commissionRate = await this.getCommissionRate(
             order.type,
             order.tariff_code
         );
 
-        const commissionBase = Number(order.total_fare) || 0;              // ⬅️ FIX
+        const commissionBase = isFood
+            ? Number(order.delivery_fee) || 0                    // ✅ FOOD
+            : Number(order.total_fare) || 0;
         const commissionAmount = Math.round(commissionBase * commissionRate);
-        const driverEarning = commissionBase - commissionAmount;            // ⬅️ FIX
+        const driverEarning = commissionBase - commissionAmount;
 
         const isCash = order.payment_method === 'cash';
         const settlementType = isCash ? 'cash' : 'gateway';
@@ -252,14 +262,23 @@ class WalletService {
         let newCashDebt = Number(wallet.cash_debt);
         const ledgerEntries: any[] = [];
 
+        // metadata tambahan khusus food (untuk audit)
+        const foodMeta = isFood
+            ? {
+                order_type: 'food',
+                delivery_fee: Number(order.delivery_fee) || 0,
+                subtotal: Number(order.subtotal) || 0,
+                packaging_fee: Number(order.packaging_fee) || 0,
+                merchant_earning: Number(order.merchant_earning) || 0,
+            }
+            : { order_type: order.type };
+
         // ────────────────────────────────────────────────────────
         // 5. Bangun ledger entries berdasarkan metode pembayaran
         // ────────────────────────────────────────────────────────
         if (isCash) {
             // ── CASH ──
-            // Driver sudah pegang uang dari customer.
-            // Komisi jadi UTANG driver ke platform.
-            // Balance tidak berubah. Cash debt bertambah.
+            // Komisi jadi UTANG driver ke platform. Balance tidak berubah.
             newCashDebt = newCashDebt + commissionAmount;
 
             ledgerEntries.push({
@@ -273,8 +292,9 @@ class WalletService {
                 description: `Pendapatan cash order #${order.id}`,
                 metadata: {
                     payment_method: 'cash',
-                    total_fare: commissionBase,
+                    commission_base: commissionBase,
                     driver_earning: driverEarning,
+                    ...foodMeta,
                 },
             });
 
@@ -291,14 +311,13 @@ class WalletService {
                     commission_rate: commissionRate,
                     commission_base: commissionBase,
                     commission_amount: commissionAmount,
+                    ...foodMeta,
                 },
             });
         } else {
             // ── GATEWAY (qris / va / wallet) ──
-            // Uang sudah masuk ke platform.
-            // Driver earning = total_fare - komisi (sudah dihitung di atas).
-            // Kalau ada utang cash, lunasi dulu.
-            const netEarning = driverEarning;                                // ⬅️ sudah bersih
+            // Uang sudah masuk ke platform. Lunasi utang cash dulu.
+            const netEarning = driverEarning;
 
             let debtPaid = 0;
             if (newCashDebt > 0) {
@@ -319,9 +338,10 @@ class WalletService {
                 description: `Pendapatan order #${order.id} (net setelah komisi)`,
                 metadata: {
                     payment_method: order.payment_method,
-                    total_fare: commissionBase,
+                    commission_base: commissionBase,
                     commission_amount: commissionAmount,
                     net_earning: netEarning,
+                    ...foodMeta,
                 },
             });
 
@@ -374,26 +394,27 @@ class WalletService {
 
         // ────────────────────────────────────────────────────────
         // 8. Update order
-        //    [FIX #3] platform_earning di-SET (bukan +=) — idempotent
-        //    [FIX #4] driver_earning ikut di-update
+        //    ✅ payment_status order cash → 'paid' setelah selesai
         // ────────────────────────────────────────────────────────
         await supabaseAdmin
             .from('orders')
             .update({
                 commission_rate: commissionRate,
                 commission_amount: commissionAmount,
-                platform_earning: commissionAmount,                          // ⬅️ SET
-                driver_earning: driverEarning,                               // ⬅️ TAMBAH
+                platform_earning: commissionAmount,
+                driver_earning: driverEarning,
                 settled_at: new Date().toISOString(),
                 settlement_type: settlementType,
+                ...(isCash ? { payment_status: 'paid' } : {}),
             })
             .eq('id', order.id);
 
         logger.info('Order settled', {
             orderId: order.id,
+            orderType: order.type,
             driverId: order.driver_id,
             settlementType,
-            totalFare: commissionBase,
+            commissionBase,
             commissionRate,
             commissionAmount,
             driverEarning,
@@ -411,7 +432,6 @@ class WalletService {
             new_cash_debt: newCashDebt,
         };
     }
-
     // ============================================================
     // GET COMMISSION RATE — FINAL (Fixed)
     // ============================================================
