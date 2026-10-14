@@ -1,62 +1,39 @@
-// src/modules/settings/admin.routes.ts
+// src/modules/settings/admin.routes.ts  (dipasang di /api/admin/settings)
 import { Router } from 'express';
 import { requireAuth, requireRole } from '../../middleware/auth';
-import { supabaseAdmin } from '../../config/supabase';
+import { asyncHandler } from '../../utils/asyncHandler';
+import { ok } from '../../utils/response';
+import { settingsService } from './settings.service';
 
 const router = Router();
+router.use(requireAuth, requireRole('admin'));
 
-/**
- * GET /api/admin/settings — list semua setting
- */
-router.get('/', requireAuth, requireRole('admin'), async (_req, res, next) => {
-    try {
-        const { data, error } = await supabaseAdmin
-            .from('app_settings')
-            .select('*')
-            .order('category', { ascending: true })
-            .order('key', { ascending: true });
+const adminId = (req: any) => req.user?.id as string | undefined;
 
-        if (error) throw error;
-        res.json({ success: true, data });
-    } catch (err) { next(err); }
-});
+/** GET /api/admin/settings — list semua setting */
+router.get('/', asyncHandler(async (_req, res) => ok(res, await settingsService.list())));
 
-/**
- * PUT /api/admin/settings/:key — update 1 setting
- */
-router.put('/:key', requireAuth, requireRole('admin'), async (req, res, next) => {
-    try {
-        const { key } = req.params;
-        const { value } = req.body;
-        const adminId = req.user!.id;
+/** POST /api/admin/settings — buat setting baru */
+router.post(
+    '/',
+    asyncHandler(async (req, res) => ok(res, await settingsService.create(req.body ?? {}, adminId(req)), 'Setting dibuat'))
+);
 
-        if (value === undefined || value === null) {
-            return res.status(400).json({
-                success: false,
-                message: 'value wajib diisi',
-            });
-        }
+/** PUT /api/admin/settings/:key — ubah value / value_type / category / is_public */
+router.put(
+    '/:key',
+    asyncHandler(async (req, res) =>
+        ok(res, await settingsService.update(req.params.key, req.body ?? {}, adminId(req)), 'Setting diupdate')
+    )
+);
 
-        const { data, error } = await supabaseAdmin
-            .from('app_settings')
-            .update({
-                value: String(value),
-                updated_by: adminId,
-            })
-            .eq('key', key)
-            .select()
-            .single();
-
-        if (error) throw error;
-        if (!data) {
-            return res.status(404).json({
-                success: false,
-                message: 'Setting tidak ditemukan',
-            });
-        }
-
-        res.json({ success: true, data });
-    } catch (err) { next(err); }
-});
+/** DELETE /api/admin/settings/:key */
+router.delete(
+    '/:key',
+    asyncHandler(async (req, res) => {
+        await settingsService.remove(req.params.key, adminId(req));
+        return ok(res, null, 'Setting dihapus');
+    })
+);
 
 export default router;

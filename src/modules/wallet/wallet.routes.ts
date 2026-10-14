@@ -12,31 +12,18 @@ router.use(requireAuth);
 // ============================================================
 router.get('/', walletController.getWallet);
 router.get('/ledger', walletController.listLedger);
-router.get('/history', walletController.listLedger); // alias lama
+router.get('/history', walletController.listLedger); // alias
 
-// ============================================================
-// 🆕 HISTORY TRANSAKSI
-// ============================================================
-router.get('/topups', walletController.listTopups);
-router.get('/withdrawals', walletController.listWithdrawals);
-router.get('/transactions', walletController.listTransactions);
-
-// ============================================================
-// TOPUP via LinkQu (VA/QRIS)
-// ============================================================
+// Topup via LinkQu (VA/QRIS)
 router.post('/topup/inquiry', walletController.topupInquiry);
 router.post('/topup/execute', walletController.topupExecute);
 router.get('/topup/status/:partnerReff', walletController.topupStatus);
 
-// ============================================================
-// WITHDRAW via LinkQu
-// ============================================================
+// Withdraw via LinkQu (bank/e-wallet)
 router.post('/withdraw/inquiry', walletController.withdrawInquiry);
 router.post('/withdraw/execute', walletController.withdrawExecute);
 
-// ============================================================
-// REKENING TERSIMPAN (maks 2)
-// ============================================================
+// Rekening tersimpan (maks 2)
 router.get('/saved-accounts', walletController.listSavedAccounts);
 router.post('/saved-accounts', walletController.saveAccount);
 router.delete('/saved-accounts/:id', walletController.deleteAccount);
