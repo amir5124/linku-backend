@@ -4,18 +4,17 @@ import crypto from 'crypto';
 import { supabaseAdmin } from '../../config/supabase';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../config/logger';
-import { notificationService } from '../notification/notification.service';
-import { MerchantWallet, merchantWalletService } from './merchant-wallet.service';// ✅ MERCHANT
+import { notificationService } from '../notification/notification.service';  // ✅ TAMBAH
 
 // ============================================================
 // KONFIGURASI LINKQU
 // ============================================================
 const LINKQU_CONFIG = {
-    clientId: process.env.LINKQU_CLIENT_ID ?? 'fdf1a7d7-076c-4430-80f6-95ea4a37ed7a',
-    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'WqbK9mSyehyenvy9zY6MNtM1s',
-    username: process.env.LINKQU_USERNAME ?? 'LI153QRSA',
-    pin: process.env.LINKQU_PIN ?? 'GFGICTz4xnPRGil',
-    serverKey: process.env.LINKQU_SERVER_KEY ?? 'GFGICTz4xnPRGil',
+    clientId: process.env.LINKQU_CLIENT_ID ?? '5f5aa496-7e16-4ca1-9967-33c768dac6c7',
+    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'TM1rVhfaFm5YJxKruHo0nWMWC',
+    username: process.env.LINKQU_USERNAME ?? 'LI9019VKS',
+    pin: process.env.LINKQU_PIN ?? '5m6uYAScSxQtCmU',
+    serverKey: process.env.LINKQU_SERVER_KEY ?? 'QtwGEr997XDcmMb1Pq8S5X1N',
     baseUrl: process.env.LINKQU_BASE_URL ?? 'https://api.linkqu.id/linkqu-partner',
 };
 
@@ -177,6 +176,10 @@ class WalletService {
     // ============================================================
     // SETTLE ORDER
     // ============================================================
+    // src/modules/wallet/wallet.service.ts
+    // ============================================================
+    // SETTLE ORDER — FINAL (Fixed)
+    // ============================================================
     async settleOrder(orderId: number) {
         // ────────────────────────────────────────────────────────
         // 1. Ambil order dari DB
@@ -209,8 +212,6 @@ class WalletService {
         }
         if (order.settled_at) {
             logger.info('Order sudah di-settle, skip', { orderId });
-            // ✅ MERCHANT: idempotent — mengulang settle merchant bila sebelumnya gagal
-            await merchantWalletService.settleOrder(order.id);
             return { already_settled: true };
         }
 
@@ -421,12 +422,6 @@ class WalletService {
             newCashDebt,
         });
 
-        // ────────────────────────────────────────────────────────
-        // 9. ✅ MERCHANT: potong komisi merchant (food). Tidak pernah throw,
-        //    jadi settle driver di atas tidak terpengaruh.
-        // ────────────────────────────────────────────────────────
-        await merchantWalletService.settleOrder(order.id);
-
         return {
             order_id: order.id,
             settlement_type: settlementType,
@@ -437,19 +432,28 @@ class WalletService {
             new_cash_debt: newCashDebt,
         };
     }
-
     // ============================================================
-    // GET COMMISSION RATE
+    // GET COMMISSION RATE — FINAL (Fixed)
     // ============================================================
-    async getCommissionRate(orderType: string, tariffCode?: string | null): Promise<number> {
+    async getCommissionRate(
+        orderType: string,
+        tariffCode?: string | null
+    ): Promise<number> {
         const { data, error } = await supabaseAdmin.rpc('get_commission_rate', {
             p_order_type: orderType,
             p_tariff_code: tariffCode ?? null,
         });
 
         if (error || data == null) {
-            logger.warn('Gagal ambil commission rate, pakai default', { error, orderType, tariffCode });
-            return orderType === 'food' ? 0.15 : 0.08;
+            logger.warn('Gagal ambil commission rate, pakai default', {
+                error,
+                orderType,
+                tariffCode,
+            });
+            // Fallback: sesuaikan dengan function DB
+            if (orderType === 'food') return 0.15;
+            if (orderType === 'send') return 0.10;
+            return 0.08;                    // ⬅️ FIX: ride default 8%
         }
 
         return Number(data);
@@ -568,7 +572,7 @@ class WalletService {
     }) {
         console.log('🚀 [topupInquiry] START', { userId, dto });
 
-        if (dto.amount < 10000) {
+        if (dto.amount < 100) {
             throw ApiError.badRequest('Minimal topup Rp10.000');
         }
 
@@ -620,7 +624,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -646,7 +650,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -861,21 +865,12 @@ class WalletService {
         amount: number;
         bank_code: string;
         account_number: string;
-        role?: 'driver' | 'customer' | 'merchant'; // ✅ MERCHANT
+        role?: 'driver' | 'customer';
     }) {
         const role = dto.role ?? 'driver';
         const wallet = role === 'driver'
             ? await this.getWallet(userId, 'driver')
-            : role === 'merchant'
-                ? await merchantWalletService.getWallet(userId)   // ✅ MERCHANT
-                : await this.getWallet(userId, 'customer');
-
-        // ✅ MERCHANT: yang masih punya utang komisi tidak boleh tarik saldo
-        if (role === 'merchant' && (wallet as MerchantWallet).cash_debt > 0) {
-            throw ApiError.badRequest(
-                `Lunasi utang komisi dulu (Rp${(wallet as MerchantWallet).cash_debt.toLocaleString('id-ID')})`
-            );
-        }
+            : await this.getWallet(userId, 'customer');
 
         // ═══════════════════════════════════════════════════════════
         // ✅ HITUNG FEE ADMIN WITHDRAW
@@ -989,7 +984,7 @@ class WalletService {
     async withdrawExecute(
         userId: string,
         inquiryReff: string,
-        role: 'driver' | 'customer' | 'merchant' = 'driver' // ✅ MERCHANT
+        role: 'driver' | 'customer' = 'driver'
     ) {
         const { data: inq } = await supabaseAdmin
             .from('wallet_withdrawals')
@@ -1048,7 +1043,7 @@ class WalletService {
             inquiry_reff: inquiryReff,
             signature,
             remark: 'Withdraw Mitra',
-            url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+            url_callback: 'https://linku.siappgo.id/api/wallet/callback',
         };
 
         try {
@@ -1122,16 +1117,6 @@ class WalletService {
                         fee_admin: feeAdmin,
                         total_deduction: totalDeduction,
                     },
-                });
-            } else if (role === 'merchant') {
-                // ✅ MERCHANT
-                await merchantWalletService.debitWithdraw(userId, {
-                    nominal: nominalTransfer,
-                    feeAdmin,
-                    totalDeduction,
-                    bankCode: inq.bank_code,
-                    accountNumber: inq.account_number,
-                    partnerReff: partnerReffPay,
                 });
             } else {
                 const customerWallet = await this.getWallet(userId, 'customer');
@@ -1235,6 +1220,173 @@ class WalletService {
         }
     }
 
+    // ============================================================
+    // LIST TOPUPS — history topup user
+    // ============================================================
+    async listTopups(
+        userId: string,
+        limit = 20,
+        offset = 0,
+        status?: string
+    ) {
+        let query = supabaseAdmin
+            .from('wallet_topups')
+            .select('*', { count: 'exact' })
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (status) {
+            query = query.eq('status', status);
+        }
+
+        const { data, error, count } = await query;
+
+        if (error) {
+            logger.error('Gagal ambil list topups', {
+                error: error.message,
+                userId,
+            });
+            throw ApiError.internal('Gagal ambil history topup');
+        }
+
+        return {
+            items: data ?? [],
+            total: count ?? 0,
+            limit,
+            offset,
+        };
+    }
+
+    // ============================================================
+    // LIST WITHDRAWALS — history withdraw user
+    // ============================================================
+    async listWithdrawals(
+        userId: string,
+        limit = 20,
+        offset = 0,
+        status?: string
+    ) {
+        let query = supabaseAdmin
+            .from('wallet_withdrawals')
+            .select('*', { count: 'exact' })
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (status) {
+            query = query.eq('status', status);
+        }
+
+        const { data, error, count } = await query;
+
+        if (error) {
+            logger.error('Gagal ambil list withdrawals', {
+                error: error.message,
+                userId,
+            });
+            throw ApiError.internal('Gagal ambil history withdraw');
+        }
+
+        return {
+            items: data ?? [],
+            total: count ?? 0,
+            limit,
+            offset,
+        };
+    }
+
+    // ============================================================
+    // LIST TRANSACTIONS — gabungan topup + withdraw + order payment
+    // Untuk halaman "Riwayat Transaksi"
+    // ============================================================
+    async listTransactions(
+        userId: string,
+        limit = 20,
+        offset = 0
+    ) {
+        // Ambil topups
+        const { data: topups } = await supabaseAdmin
+            .from('wallet_topups')
+            .select('id, partner_reff, method, amount, nominal, admin_fee, status, created_at, va_number, qris_url')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Ambil withdrawals
+        const { data: withdrawals } = await supabaseAdmin
+            .from('wallet_withdrawals')
+            .select('id, inquiry_reff, partner_reff, bank_code, account_number, amount, fee_admin, status, created_at')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Ambil wallet transactions (order payment, refund, dll)
+        const { data: transactions } = await supabaseAdmin
+            .from('wallet_transactions')
+            .select('*')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        // Gabung & normalisasi
+        const items = [
+            ...(topups ?? []).map((t) => ({
+                id: `topup-${t.id}`,
+                type: 'topup' as const,
+                amount: Number(t.nominal ?? t.amount),
+                total_amount: Number(t.amount),
+                admin_fee: Number(t.admin_fee ?? 0),
+                method: t.method ?? 'va',
+                status: t.status,
+                reference: t.partner_reff,
+                va_number: t.va_number,
+                qris_url: t.qris_url,
+                created_at: t.created_at,
+                description: `Topup via ${t.method?.toUpperCase() ?? 'LinkQu'}`,
+            })),
+            ...(withdrawals ?? []).map((w) => ({
+                id: `withdraw-${w.id}`,
+                type: 'withdraw' as const,
+                amount: Number(w.amount),
+                total_amount: Number(w.amount) + Number(w.fee_admin ?? 0),
+                admin_fee: Number(w.fee_admin ?? 0),
+                method: 'va',
+                status: w.status,
+                reference: w.partner_reff,
+                bank_code: w.bank_code,
+                account_number: w.account_number,
+                created_at: w.created_at,
+                description: `Withdraw ke ${w.bank_code} ${w.account_number}`,
+            })),
+            ...(transactions ?? []).map((t) => ({
+                id: `tx-${t.id}`,
+                type: t.type as any,
+                amount: Number(t.amount),
+                total_amount: Number(t.amount),
+                admin_fee: 0,
+                method: 'internal',
+                status: 'SUCCESS',
+                reference: t.reference_id,
+                created_at: t.created_at,
+                description: t.description,
+            })),
+        ];
+
+        // Sort by created_at DESC
+        items.sort(
+            (a, b) =>
+                new Date(b.created_at).getTime() -
+                new Date(a.created_at).getTime()
+        );
+
+        return {
+            items: items.slice(0, limit),
+            limit,
+            offset,
+        };
+    }
+
     // Di wallet.service.ts
     async createOrderPayment(input: {
         orderId: number;
@@ -1256,8 +1408,7 @@ class WalletService {
         const customerEmail = profile?.email ?? 'noreply@warung.id';
 
         const partnerReff = `ORDER-${input.orderId}-${Date.now()}`;
-        // wallet.service.ts — createOrderPayment
-        const expired = this.generateExpiredTimestamp(15); // ⬅️ dari 30 → 15
+        const expired = this.generateExpiredTimestamp(15);
 
         let endpoint = '';
         let payload: any = {};
@@ -1279,7 +1430,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1306,7 +1457,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1315,6 +1466,8 @@ class WalletService {
 
         // 2. Request ke LinkQu
         const url = `${LINKQU_CONFIG.baseUrl}${endpoint}`;
+        console.log('📤 [createOrderPayment] REQUEST', { url, payload });
+
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -1328,7 +1481,17 @@ class WalletService {
             body: JSON.stringify(payload),
         });
 
+        // ✅ BACA RAW DULU
         const rawText = await response.text();
+        console.log('📥 [createOrderPayment] HTTP', response.status);
+        console.log('📥 [createOrderPayment] RAW', rawText);
+
+        if (!response.ok) {
+            throw ApiError.internal(
+                `LinkQu error ${response.status}: ${rawText.slice(0, 200)}`
+            );
+        }
+
         let data: any;
         try {
             data = JSON.parse(rawText);
@@ -1336,11 +1499,57 @@ class WalletService {
             throw ApiError.internal('Response LinkQu tidak valid');
         }
 
-        if (!response.ok) {
-            throw ApiError.internal(`LinkQu error ${response.status}`);
+        console.log(
+            '✅ [createOrderPayment] PARSED',
+            JSON.stringify(data, null, 2)
+        );
+
+        // ═══════════════════════════════════════════════════════════
+        // ✅ PARSE VA NUMBER & QR URL DARI BERBAGAI BENTUK RESPONSE
+        // ═══════════════════════════════════════════════════════════
+        const vaNumber =
+            data?.data?.virtual_account ??
+            data?.virtual_account ??
+            data?.data?.va_number ??
+            data?.va_number ??
+            data?.data?.vaNumber ??
+            data?.vaNumber ??
+            null;
+
+        const qrUrl =
+            data?.data?.imageqris ??
+            data?.imageqris ??
+            data?.data?.qr_url ??
+            data?.qr_url ??
+            data?.data?.qris_url ??
+            data?.qris_url ??
+            null;
+
+        const expiredFromLinkqu =
+            data?.data?.expired ??
+            data?.expired ??
+            data?.data?.expired_at ??
+            data?.expired_at ??
+            null;
+
+        console.log('📋 [createOrderPayment] Parsed:', {
+            vaNumber,
+            qrUrl,
+            expiredFromLinkqu,
+            method: input.method,
+        });
+
+        // ⚠️ Kalau VA method tapi VA number kosong, log warning
+        if (input.method === 'va' && !vaNumber) {
+            console.error(
+                '❌ [createOrderPayment] LinkQu TIDAK mengembalikan va_number! Full response:',
+                JSON.stringify(data, null, 2)
+            );
         }
 
         // 3. Simpan ke DB
+        const expiredAt = this.parseExpiredToDate(expired);
+
         await supabaseAdmin.from('order_payments').insert({
             order_id: input.orderId,
             user_id: input.userId,
@@ -1348,22 +1557,21 @@ class WalletService {
             method: input.method,
             amount: input.amount,
             bank_code: input.bankCode ?? null,
-            va_number: data?.virtual_account ?? null,
-            qr_url: data?.imageqris ?? null,
+            va_number: vaNumber,
+            qr_url: qrUrl,
             status: 'PENDING',
             raw_response: data,
-            expired_at: this.parseExpiredToDate(expired),
+            expired_at: expiredAt,
         });
 
         return {
             ...data,
             partner_reff: partnerReff,
-            va_number: data?.virtual_account ?? null,
-            qr_url: data?.imageqris ?? null,
-            expired_at: this.parseExpiredToDate(expired),
+            va_number: vaNumber,        // ✅ hasil parse lengkap
+            qr_url: qrUrl,              // ✅ hasil parse lengkap
+            expired_at: expiredAt,
         };
     }
-
     // Di wallet.service.ts
     async payWithWallet(userId: string, orderId: number, amount: number) {
         logger.info('[wallet.payWithWallet] START', { userId, orderId, amount });

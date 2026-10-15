@@ -3,7 +3,6 @@ import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';
-import { merchantWalletService } from './merchant-wallet.service'; // ✅ MERCHANT
 
 const router = Router();
 
@@ -202,10 +201,6 @@ async function handleTopupCallback(
 
     const isDriver = !!driverProfile;
 
-    // ✅ MERCHANT: cek hanya kalau bukan driver
-    const isMerchant =
-        !isDriver && (await merchantWalletService.isMerchantUser(userId));
-
     // ═══════════════════════════════════════════════════════════
     // DRIVER
     // ═══════════════════════════════════════════════════════════
@@ -301,33 +296,6 @@ async function handleTopupCallback(
             debtPaid,
             newBalance,
             newCashDebt,
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // ✅ MERCHANT — lunasi utang komisi dulu, sisa masuk saldo
-    // ═══════════════════════════════════════════════════════════
-    else if (isMerchant) {
-        const r = await merchantWalletService.creditTopup(userId, netAmount, {
-            partnerReff: topup.partner_reff,
-            method: topup.method,
-            nominal,
-            adminFee,
-            totalBayar,
-            vaCode: va_code,
-            serialnumber,
-        });
-
-        logger.info('✅ Topup SUCCESS (merchant)', {
-            partner_reff: topup.partner_reff,
-            userId,
-            totalBayar,
-            nominal,
-            adminFee,
-            netAmount,
-            debtPaid: r.debtPaid,
-            newBalance: r.newBalance,
-            newCashDebt: r.newCashDebt,
         });
     }
 
@@ -488,10 +456,6 @@ async function handleWithdrawCallback(wd: any, status: string) {
 
         const isDriver = !!driverProfile;
 
-        // ✅ MERCHANT: cek hanya kalau bukan driver
-        const isMerchant =
-            !isDriver && (await merchantWalletService.isMerchantUser(userId));
-
         if (isDriver) {
             const { data: wallet } = await supabaseAdmin
                 .from('driver_wallets')
@@ -526,14 +490,6 @@ async function handleWithdrawCallback(wd: any, status: string) {
                     fee_admin: feeAdmin,
                     total_refund: totalDeduction,
                 },
-            });
-        } else if (isMerchant) {
-            // ✅ MERCHANT
-            await merchantWalletService.refundWithdraw(userId, {
-                inquiryReff: wd.inquiry_reff,
-                nominal,
-                feeAdmin,
-                totalRefund: totalDeduction,
             });
         } else {
             const { data: wallet } = await supabaseAdmin
