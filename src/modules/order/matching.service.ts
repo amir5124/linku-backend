@@ -3,6 +3,31 @@ import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
 
 // ============================================================
+// KONFIGURASI
+// ============================================================
+
+/** Radius pencarian driver dari titik jemput (meter). 15 km. */
+const MATCH_RADIUS_M = Number(process.env.MATCH_RADIUS_M ?? 15000);
+
+/** Maksimum driver yang ditawari per order. */
+const MATCH_LIMIT = 20;
+
+/**
+ * Kode tarif bawaan per jenis order, dipakai HANYA kalau aplikasi customer
+ * tidak mengirim tariff_code. Tanpa ini, fungsi SQL find_nearby_drivers
+ * tidak memfilter layanan dan order sampai ke SEMUA driver online.
+ *
+ * Makanan hanya punya satu kode, jadi aman diisi bawaan.
+ * Ride/send punya varian S dan L, jadi tidak ditebak.
+ *
+ * Sesuaikan lewat env FOOD_TARIFF_CODE kalau kodenya berbeda
+ * (contoh data sekarang: 'warfood'; di LinkU mungkin 'ufood').
+ */
+const DEFAULT_TARIFF_BY_TYPE: Record<string, string | undefined> = {
+    food: process.env.FOOD_TARIFF_CODE ?? 'warfood',
+};
+
+// ============================================================
 // TYPE — hasil dari RPC find_nearby_drivers
 // ============================================================
 export type NearbyDriverResult = {
@@ -23,7 +48,7 @@ export const matchingService = {
      * @param lng         Longitude titik pickup
      * @param type        Tipe order ('ride' | 'food' | 'send')
      * @param tariffCode  Kode tarif (opsional) — untuk filter service driver
-     * @returns           List driver yang eligible
+     * @returns           List driver yang eligible (sudah punya bid)
      */
     async findDriversForOrder(
         orderId: number,
@@ -32,9 +57,34 @@ export const matchingService = {
         type: string,
         tariffCode?: string | null
     ): Promise<NearbyDriverResult[]> {
+        const effectiveCode = tariffCode ?? DEFAULT_TARIFF_BY_TYPE[type] ?? null;
+
         console.log('[matching] === CARI DRIVER ===');
         console.log('[matching] orderId:', orderId, '| pickup:', { lat, lng });
-        console.log('[matching] type:', type, '| tariff_code:', tariffCode);
+        console.log(
+            '[matching] type:',
+            type,
+            '| tariff_code:',
+            tariffCode,
+            '| dipakai:',
+            effectiveCode,
+            '| radius:',
+            MATCH_RADIUS_M,
+            'm'
+        );
+
+        if (!tariffCode && !effectiveCode) {
+            logger.warn(
+                '[matching] tariff_code kosong, filter layanan tidak aktif (order sampai ke semua driver online)',
+                { orderId, type }
+            );
+        } else if (!tariffCode && effectiveCode) {
+            logger.warn('[matching] tariff_code kosong, pakai kode bawaan', {
+                orderId,
+                type,
+                effectiveCode,
+            });
+        }
 
         // ═══════════════════════════════════════════════════════════
         // 1. Panggil RPC find_nearby_drivers
@@ -44,9 +94,9 @@ export const matchingService = {
             {
                 p_lat: lat,
                 p_lng: lng,
-                p_radius_m: 20000,          // 20 km
-                p_limit: 20,
-                p_tariff_code: tariffCode ?? null,
+                p_radius_m: MATCH_RADIUS_M,
+                p_limit: MATCH_LIMIT,
+                p_tariff_code: effectiveCode,
             }
         );
 
@@ -68,7 +118,8 @@ export const matchingService = {
                 orderId,
                 lat,
                 lng,
-                tariffCode,
+                tariffCode: effectiveCode,
+                radiusM: MATCH_RADIUS_M,
             });
             return [];
         }
@@ -88,18 +139,18 @@ export const matchingService = {
             .insert(bids);
 
         if (bidErr) {
+            // Tanpa bid, driver tidak bisa menerima order (accept() mewajibkan bid).
+            // Jadi jangan kembalikan daftar driver, supaya tidak ada notifikasi
+            // yang terkirim untuk order yang tidak bisa diambil.
             console.error('[matching] Gagal insert bids:', bidErr);
             logger.error('Gagal insert bids', {
                 error: bidErr,
                 orderId,
             });
-        } else {
-            console.log(
-                '[matching] ✅ Berhasil insert',
-                bids.length,
-                'bid'
-            );
+            return [];
         }
+
+        console.log('[matching] ✅ Berhasil insert', bids.length, 'bid');
 
         return result;
     },

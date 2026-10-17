@@ -6,9 +6,6 @@ import { notificationService } from '../notification/notification.service';
 import { merchantWalletService } from '../wallet/merchant-wallet.service';
 import { logger } from '../../config/logger';
 
-// ============================================================
-// ✅ COPY MODULE — teks notifikasi per layanan (ride/send/food)
-// ============================================================
 import {
     kindOf,
     newOrderForDriver,
@@ -21,9 +18,12 @@ import {
 // Helpers
 // ============================================================
 
+type Coords = { latitude: number; longitude: number };
+
 const generateOrderCode = () =>
     'GR' + Date.now().toString().slice(-10) + Math.floor(Math.random() * 1000);
 
+// 'accepted' di sini hanya dicapai lewat accept() / autobid / admin.
 const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
     pending: ['accepted', 'cancelled'],
     accepted: ['arrived', 'cancelled'],
@@ -33,7 +33,7 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
     cancelled: [],
 };
 
-function parseEwkbHex(hex: string): { latitude: number; longitude: number } | null {
+function parseEwkbHex(hex: string): Coords | null {
     if (!hex || typeof hex !== 'string') return null;
     if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length < 50) return null;
 
@@ -67,9 +67,7 @@ function parseEwkbHex(hex: string): { latitude: number; longitude: number } | nu
     return null;
 }
 
-function parseLocation(
-    loc: any
-): { latitude: number; longitude: number } | null {
+function parseLocation(loc: any): Coords | null {
     if (!loc) return null;
 
     if (typeof loc === 'string') {
@@ -90,10 +88,7 @@ function parseLocation(
         }
     }
 
-    if (
-        typeof loc.latitude === 'number' &&
-        typeof loc.longitude === 'number'
-    ) {
+    if (typeof loc.latitude === 'number' && typeof loc.longitude === 'number') {
         return { latitude: loc.latitude, longitude: loc.longitude };
     }
 
@@ -130,6 +125,54 @@ function haversineKm(
         Math.cos(toRad(lat2)) *
         Math.sin(dLng / 2) ** 2;
     return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+const rp = (n: number) => `Rp${Number(n).toLocaleString('id-ID')}`;
+
+// ============================================================
+// ✅ [BARU] HELPER: Validasi toko buka & verified
+// Dipakai di create() & merchantRespond() supaya order yang
+// masuk ke toko yang sedang TUTUP selalu ditolak di server,
+// bukan cuma di UI aplikasi.
+// ============================================================
+async function assertMerchantOpen(
+    merchantId: string,
+    context: string
+): Promise<{ store_name: string }> {
+    const { data: merchant, error } = await supabaseAdmin
+        .from('merchant_profiles')
+        .select('user_id, store_name, is_open, is_verified')
+        .eq('user_id', merchantId)
+        .maybeSingle();
+
+    if (error) {
+        logger.error(`[${context}] Gagal cek merchant`, {
+            error: error.message,
+            merchantId,
+        });
+        throw ApiError.internal('Gagal memvalidasi toko');
+    }
+
+    if (!merchant) {
+        throw ApiError.badRequest('Toko tidak ditemukan');
+    }
+
+    if (merchant.is_verified === false) {
+        logger.warn(`[${context}] Toko belum verified`, { merchantId });
+        throw ApiError.badRequest('Toko belum terverifikasi');
+    }
+
+    if (merchant.is_open !== true) {
+        logger.warn(`[${context}] Toko sedang tutup`, {
+            merchantId,
+            storeName: merchant.store_name,
+        });
+        throw ApiError.badRequest(
+            `Toko "${merchant.store_name}" sedang tutup. Silakan pilih toko lain atau coba lagi nanti.`
+        );
+    }
+
+    return { store_name: merchant.store_name };
 }
 
 type OrderItemInput = {
@@ -269,10 +312,13 @@ export const orderService = {
                 throw ApiError.badRequest('Item pesanan wajib diisi');
             }
 
+            // ============================================================
+            // ✅ [BARU] VALIDASI: toko buka & verified
+            // ============================================================
+            await assertMerchantOpen(String(input.merchant_id), 'order.create');
+
             const ids: number[] = Array.from(
-                new Set<number>(
-                    input.items.map((i: any) => Number(i.menu_item_id))
-                )
+                new Set<number>(input.items.map((i: any) => Number(i.menu_item_id)))
             );
             if (ids.some((id) => !Number.isFinite(id))) {
                 throw ApiError.badRequest('Item pesanan tidak valid');
@@ -379,9 +425,7 @@ export const orderService = {
             const balance = Number(customerWallet?.balance ?? 0);
             if (balance < total_fare) {
                 throw ApiError.badRequest(
-                    `Saldo tidak cukup. Butuh Rp${total_fare.toLocaleString(
-                        'id-ID'
-                    )}, saldo: Rp${balance.toLocaleString('id-ID')}`
+                    `Saldo tidak cukup. Butuh ${rp(total_fare)}, saldo: ${rp(balance)}`
                 );
             }
         }
@@ -402,6 +446,23 @@ export const orderService = {
             }
             logger.info('[order.create] send_code', { sendCode });
         }
+
+        const { data: setting } = await supabaseAdmin
+            .from('settings')
+            .select('value')
+            .eq('key', 'order_accept_duration_sec')
+            .maybeSingle();
+
+        const acceptDurationSec = Number(setting?.value ?? 30);
+
+        const acceptExpiresAt = new Date(
+            Date.now() + acceptDurationSec * 1000
+        ).toISOString();
+
+        logger.info('[order.create] accept_expires_at', {
+            acceptDurationSec,
+            acceptExpiresAt,
+        });
 
         const { data: order, error } = await supabaseAdmin
             .from('orders')
@@ -437,6 +498,8 @@ export const orderService = {
                 option_name: tariffLabel,
                 send_code: sendCode,
                 status: 'pending',
+
+                accept_expires_at: acceptExpiresAt,
 
                 sender_landmark: input.sender_landmark ?? null,
                 receiver_landmark: input.receiver_landmark ?? null,
@@ -492,19 +555,11 @@ export const orderService = {
         // ═══════════════════════════════════════════════════════════
         // HANDLE PAYMENT
         // ═══════════════════════════════════════════════════════════
-        let paymentMeta: {
-            status: string;
-            reference?: string;
-            url?: string;
-            expires_at?: string;
-        } = { status: 'pending' };
-
         if (paymentMethod === 'cash') {
             logger.info('[order.create] Payment: CASH', {
                 orderId: order.id,
                 amount: total_fare,
             });
-            paymentMeta = { status: 'pending' };
         } else if (paymentMethod === 'wallet') {
             logger.info('[order.create] Payment: WALLET', {
                 orderId: order.id,
@@ -513,20 +568,13 @@ export const orderService = {
             });
 
             try {
-                const { walletService } = await import(
-                    '../wallet/wallet.service'
-                );
+                const { walletService } = await import('../wallet/wallet.service');
 
                 const result = await walletService.payWithWallet(
                     customerId,
                     order.id,
                     total_fare
                 );
-
-                paymentMeta = {
-                    status: 'paid',
-                    reference: `WALLET-${order.id}`,
-                };
 
                 await supabaseAdmin
                     .from('orders')
@@ -557,9 +605,7 @@ export const orderService = {
                     })
                     .eq('id', order.id);
 
-                throw ApiError.internal(
-                    'Gagal potong saldo: ' + err.message
-                );
+                throw ApiError.internal('Gagal potong saldo: ' + err.message);
             }
         } else if (
             paymentMethod === 'qris' ||
@@ -573,9 +619,7 @@ export const orderService = {
             });
 
             try {
-                const { walletService } = await import(
-                    '../wallet/wallet.service'
-                );
+                const { walletService } = await import('../wallet/wallet.service');
 
                 const payment = await walletService.createOrderPayment({
                     orderId: order.id,
@@ -584,13 +628,6 @@ export const orderService = {
                     method: paymentMethod === 'qris' ? 'qris' : 'va',
                     bankCode: input.bank_code,
                 });
-
-                paymentMeta = {
-                    status: 'pending',
-                    reference: payment.partner_reff,
-                    url: payment.qr_url ?? payment.va_number,
-                    expires_at: payment.expired_at,
-                };
 
                 await supabaseAdmin
                     .from('orders')
@@ -624,87 +661,401 @@ export const orderService = {
                     })
                     .eq('id', order.id);
 
-                throw ApiError.internal(
-                    'Gagal buat payment: ' + err.message
-                );
+                throw ApiError.internal('Gagal buat payment: ' + err.message);
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // MATCHING DRIVER
-        // ═══════════════════════════════════════════════════════════
-        logger.info('[order.create] Mencari driver...', {
-            orderId: order.id,
-            type: input.type,
+        await orderService.onOrderReady(order, {
+            pickup: {
+                latitude: Number(input.pickup_lat),
+                longitude: Number(input.pickup_lng),
+            },
+            dropoff: {
+                latitude: Number(input.dropoff_lat),
+                longitude: Number(input.dropoff_lng),
+            },
         });
+
+        return await orderService.getById(order.id, customerId, 'customer');
+    },
+
+    // ============================================================
+    // ORDER SIAP (pembayaran beres)
+    // ============================================================
+    async onOrderReady(
+        order: any,
+        hint: { pickup?: Coords; dropoff?: Coords } = {}
+    ) {
+        if (order.type === 'food' && order.merchant_id) {
+            const { data: claimed } = await supabaseAdmin
+                .from('orders')
+                .update({
+                    merchant_status: 'waiting',
+                    merchant_notified_at: new Date().toISOString(),
+                })
+                .eq('id', order.id)
+                .eq('status', 'pending')
+                .is('merchant_status', null)
+                .select('id')
+                .maybeSingle();
+
+            if (!claimed) {
+                logger.info('[order.onReady] Toko sudah pernah dikabari, skip', {
+                    orderId: order.id,
+                });
+                return;
+            }
+
+            await orderService.notifyMerchantNewOrder(order);
+            return;
+        }
+
+        await orderService.dispatchToDrivers(order.id, hint);
+    },
+
+    // ============================================================
+    // NOTIF: pesanan baru → TOKO
+    // ============================================================
+    async notifyMerchantNewOrder(order: any) {
+        const { data: items } = await supabaseAdmin
+            .from('order_items')
+            .select('qty')
+            .eq('order_id', order.id);
+
+        const count = (items ?? []).reduce(
+            (s: number, i: any) => s + Number(i.qty),
+            0
+        );
+
+        try {
+            await notificationService.sendToUser(order.merchant_id, {
+                title: 'Pesanan baru masuk 🔔',
+                body: `${count} item · ${rp(order.subtotal)} · Segera konfirmasi`,
+                data: {
+                    order_id: String(order.id),
+                    order_code: order.order_code,
+                    type: 'merchant_new_order',
+                    service: 'food',
+                },
+            });
+        } catch (err: any) {
+            logger.warn('[order] Gagal notif merchant', {
+                orderId: order.id,
+                err: err.message,
+            });
+        }
+
+        try {
+            await notificationService.sendToUser(order.customer_id, {
+                title: 'Menunggu konfirmasi toko',
+                body: 'Pesananmu sudah diteruskan ke toko.',
+                data: {
+                    order_id: String(order.id),
+                    type: 'waiting_merchant',
+                    service: 'food',
+                },
+            });
+        } catch {
+            /* abaikan */
+        }
+    },
+
+    // ============================================================
+    // RESPONS TOKO (terima / tolak)
+    // ============================================================
+    async merchantRespond(
+        orderId: number,
+        merchantId: string,
+        accept: boolean,
+        opts: { prep_minutes?: number; reason?: string } = {}
+    ) {
+        const { data: order } = await supabaseAdmin
+            .from('orders')
+            .select('*')
+            .eq('id', orderId)
+            .single();
+
+        if (!order) throw ApiError.notFound('Order not found');
+        if (order.merchant_id !== merchantId) throw ApiError.forbidden();
+        if (order.status !== 'pending' || order.merchant_status !== 'waiting') {
+            throw ApiError.conflict('Pesanan sudah direspons');
+        }
+
+        // ============================================================
+        // ✅ [BARU] VALIDASI: toko masih buka saat terima pesanan
+        // (mencegah toko terima order padahal sudah tutup)
+        // ============================================================
+        if (accept) {
+            await assertMerchantOpen(merchantId, 'order.merchantRespond');
+        }
+
+        const now = new Date().toISOString();
+        const patch: any = accept
+            ? {
+                merchant_status: 'accepted',
+                merchant_responded_at: now,
+                prep_minutes: opts.prep_minutes ?? null,
+            }
+            : {
+                merchant_status: 'rejected',
+                merchant_responded_at: now,
+                status: 'cancelled',
+                cancelled_at: now,
+                cancellation_reason: opts.reason ?? 'Ditolak toko',
+            };
+
+        const { data: updated } = await supabaseAdmin
+            .from('orders')
+            .update(patch)
+            .eq('id', orderId)
+            .eq('status', 'pending')
+            .eq('merchant_status', 'waiting')
+            .select()
+            .maybeSingle();
+
+        if (!updated) throw ApiError.conflict('Pesanan sudah direspons');
+
+        logger.info('[order.merchantRespond]', {
+            orderId,
+            merchantId,
+            accept,
+            prep: opts.prep_minutes,
+        });
+
+        if (accept) {
+            await notificationService
+                .sendToUser(order.customer_id, {
+                    title: 'Pesanan diterima toko ✅',
+                    body: opts.prep_minutes
+                        ? `Estimasi disiapkan ±${opts.prep_minutes} menit. Sedang mencarikan driver.`
+                        : 'Sedang mencarikan driver untukmu.',
+                    data: {
+                        order_id: String(orderId),
+                        type: 'merchant_accepted',
+                        service: 'food',
+                    },
+                })
+                .catch(() => { });
+
+            await orderService.dispatchToDrivers(orderId);
+        } else {
+            orderService.flagRefundIfPaid(updated);
+
+            await notificationService
+                .sendToUser(order.customer_id, {
+                    title: 'Pesanan ditolak toko',
+                    body: opts.reason ?? 'Toko tidak dapat memproses pesananmu saat ini.',
+                    data: {
+                        order_id: String(orderId),
+                        type: 'order_cancelled',
+                        service: 'food',
+                    },
+                })
+                .catch(() => { });
+        }
+
+        return updated;
+    },
+
+    async merchantMarkReady(orderId: number, merchantId: string) {
+        const ALLOWED = ['pending', 'accepted', 'arrived'];
+
+        const { data: order } = await supabaseAdmin
+            .from('orders')
+            .select('*')
+            .eq('id', orderId)
+            .single();
+
+        if (!order) throw ApiError.notFound('Order not found');
+        if (order.merchant_id !== merchantId) throw ApiError.forbidden();
+        if (order.type !== 'food' || order.merchant_status !== 'accepted') {
+            throw ApiError.badRequest('Pesanan belum diterima toko');
+        }
+        if (!ALLOWED.includes(order.status)) {
+            throw ApiError.conflict('Pesanan sudah diambil driver atau selesai');
+        }
+        if (order.merchant_ready_at) return order;
+
+        const { data: updated } = await supabaseAdmin
+            .from('orders')
+            .update({ merchant_ready_at: new Date().toISOString() })
+            .eq('id', orderId)
+            .is('merchant_ready_at', null)
+            .in('status', ALLOWED)
+            .select()
+            .maybeSingle();
+
+        if (!updated) throw ApiError.conflict('Status pesanan sudah berubah, muat ulang');
+
+        const { data: store } = await supabaseAdmin
+            .from('merchant_profiles')
+            .select('store_name')
+            .eq('user_id', merchantId)
+            .maybeSingle();
+        const storeName = store?.store_name ?? 'Toko';
+
+        if (order.driver_id) {
+            await notificationService
+                .sendToUser(order.driver_id, {
+                    title: 'Pesanan sudah siap diambil 🍱',
+                    body: `${storeName}: pesanan ${order.order_code} siap, silakan diambil`,
+                    data: {
+                        order_id: String(orderId),
+                        type: 'food_ready',
+                        service: 'food',
+                    },
+                })
+                .catch((err: any) =>
+                    logger.warn('[order.ready] Gagal notif driver', { orderId, err: err.message })
+                );
+        }
+
+        await notificationService
+            .sendToUser(order.customer_id, {
+                title: 'Pesananmu sudah siap 🍱',
+                body: order.driver_id
+                    ? 'Driver sedang mengambil pesananmu.'
+                    : 'Menunggu driver mengambil pesananmu.',
+                data: {
+                    order_id: String(orderId),
+                    type: 'food_ready',
+                    service: 'food',
+                },
+            })
+            .catch(() => { });
+
+        logger.info('[order.ready] Ditandai siap', { orderId, merchantId, hasDriver: !!order.driver_id });
+        return updated;
+    },
+
+    // ============================================================
+    // DISPATCH KE DRIVER
+    // ============================================================
+    async dispatchToDrivers(
+        orderId: number,
+        hint: { pickup?: Coords; dropoff?: Coords } = {}
+    ) {
+        logger.info('[order.dispatch] START', { orderId });
+
+        const { data: order } = await supabaseAdmin
+            .from('orders')
+            .select('*')
+            .eq('id', orderId)
+            .single();
+
+        if (!order) {
+            logger.warn('[order.dispatch] Order tidak ditemukan', { orderId });
+            return;
+        }
+        if (order.status !== 'pending') {
+            logger.warn('[order.dispatch] Order tidak pending, skip', {
+                orderId,
+                status: order.status,
+            });
+            return;
+        }
+
+        const payOk =
+            order.payment_status === 'paid' || order.payment_method === 'cash';
+        if (!payOk) {
+            logger.warn('[order.dispatch] Payment belum paid, skip', {
+                orderId,
+                paymentStatus: order.payment_status,
+            });
+            return;
+        }
+
+        if (
+            order.type === 'food' &&
+            order.merchant_id &&
+            order.merchant_status !== 'accepted'
+        ) {
+            logger.warn('[order.dispatch] Toko belum menerima, skip', {
+                orderId,
+                merchantStatus: order.merchant_status,
+            });
+            return;
+        }
+
+        const { count: bidCount } = await supabaseAdmin
+            .from('order_bids')
+            .select('id', { count: 'exact', head: true })
+            .eq('order_id', orderId);
+        if ((bidCount ?? 0) > 0) {
+            logger.info('[order.dispatch] Sudah pernah di-dispatch, skip', {
+                orderId,
+            });
+            return;
+        }
+
+        const pickupCoords = hint.pickup ?? parseLocation(order.pickup_location);
+        const dropoffCoords =
+            hint.dropoff ?? parseLocation(order.dropoff_location);
+        if (!pickupCoords) {
+            logger.error('[order.dispatch] Pickup coords invalid', { orderId });
+            return;
+        }
+
+        const kind = kindOf(order.type);
 
         const drivers = await matchingService.findDriversForOrder(
             order.id,
-            input.pickup_lat,
-            input.pickup_lng,
-            input.type,
-            tariffCode
+            pickupCoords.latitude,
+            pickupCoords.longitude,
+            order.type,
+            order.tariff_code
         );
 
-        logger.info('[order.create] Driver ditemukan', {
-            orderId: order.id,
+        logger.info('[order.dispatch] Driver ditemukan', {
+            orderId,
             driverCount: drivers.length,
         });
 
-        // ═══════════════════════════════════════════════════════════
-        // AUTO BID
-        // ═══════════════════════════════════════════════════════════
-        let autobidDriver: string | null = null;
-
-        if (drivers.length > 0) {
+        if (drivers.length === 0) {
             try {
-                const { autobidService } = await import('./autobid.service');
-
-                autobidDriver = await autobidService.tryAutoBid(
-                    order.id,
-                    {
-                        type: order.type,
-                        driver_earning: Number(order.driver_earning),
-                        distance_km: Number(order.distance_km),
+                const searching = searchingForCustomer(kind);
+                await notificationService.sendToUser(order.customer_id, {
+                    title: searching.title,
+                    body: searching.body,
+                    data: {
+                        order_id: order.id,
+                        type: 'no_driver_yet',
+                        service: order.type,
                     },
-                    drivers.map((d) => d.user_id)
-                );
-
-                if (autobidDriver) {
-                    logger.info('[order.create] ✅ Autobid sukses', {
-                        orderId: order.id,
-                        driverId: autobidDriver,
-                    });
-                } else {
-                    logger.info(
-                        '[order.create] Autobid tidak ada yang eligible',
-                        { orderId: order.id }
-                    );
-                }
+                });
             } catch (err: any) {
-                logger.warn('[order.create] Autobid error', {
-                    orderId: order.id,
-                    error: err.message,
+                logger.warn('[order.dispatch] Gagal notif customer (no driver)', {
+                    orderId,
+                    err: err.message,
                 });
             }
+            return;
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // AMBIL CUSTOMER PROFILE + ITEMS UNTUK NOTIF
-        // ═══════════════════════════════════════════════════════════
+        let autobidDriver: string | null = null;
+        try {
+            const { autobidService } = await import('./autobid.service');
+            autobidDriver = await autobidService.tryAutoBid(
+                order.id,
+                {
+                    type: order.type,
+                    driver_earning: Number(order.driver_earning),
+                    distance_km: Number(order.distance_km),
+                },
+                drivers.map((d) => d.user_id)
+            );
+        } catch (err: any) {
+            logger.warn('[order.dispatch] Autobid error', {
+                orderId,
+                error: err.message,
+            });
+        }
+
         const { data: custProfile } = await supabaseAdmin
             .from('profiles')
             .select('full_name, avatar_url')
-            .eq('id', customerId)
+            .eq('id', order.customer_id)
             .maybeSingle();
-
-        const pickupShort = prettyPlace(input.pickup_name);
-        const dropoffShort = prettyPlace(input.dropoff_name);
-        const jarakText =
-            distanceKm < 1
-                ? `${Math.round(distanceKm * 1000)} m`
-                : `${distanceKm.toFixed(1)} km`;
-        const fareText = `Rp${Number(delivery_fee).toLocaleString('id-ID')}`;
 
         let itemsForNotif: any[] = [];
         if (order.type === 'food') {
@@ -712,27 +1063,29 @@ export const orderService = {
                 .from('order_items')
                 .select('menu_item_id, name, variant, qty, price')
                 .eq('order_id', order.id);
-
             itemsForNotif = orderItems ?? [];
         }
 
-        const orderPayloadForNotif = {
+        const distKm = Number(order.distance_km);
+        const jarakText =
+            distKm < 1
+                ? `${Math.round(distKm * 1000)} m`
+                : `${distKm.toFixed(1)} km`;
+        const pickupShort = prettyPlace(order.pickup_name);
+        const dropoffShort = prettyPlace(order.dropoff_name);
+        const fareText = rp(order.delivery_fee);
+
+        const orderPayload = {
             id: String(order.id),
             order_code: order.order_code,
             type: order.type,
             status: order.status,
             pickup_name: order.pickup_name ?? '',
             pickup_address: order.pickup_address ?? '',
-            pickup_coords: {
-                latitude: input.pickup_lat,
-                longitude: input.pickup_lng,
-            },
+            pickup_coords: pickupCoords,
             dropoff_name: order.dropoff_name ?? '',
             dropoff_address: order.dropoff_address ?? '',
-            dropoff_coords: {
-                latitude: input.dropoff_lat,
-                longitude: input.dropoff_lng,
-            },
+            dropoff_coords: dropoffCoords,
             distance_km: String(order.distance_km ?? 0),
             duration_min: String(order.duration_min ?? 0),
             delivery_fee: String(order.delivery_fee ?? 0),
@@ -740,17 +1093,13 @@ export const orderService = {
             total_fare: String(order.total_fare ?? 0),
             subtotal: String(order.subtotal ?? 0),
             payment_method: order.payment_method ?? 'cash',
-            payment_status: paymentMeta.status,
-            payment_reference: paymentMeta.reference ?? null,
-            payment_url: paymentMeta.url ?? null,
-            payment_expires_at: paymentMeta.expires_at ?? null,
+            payment_status: order.payment_status,
+            payment_reference: order.payment_reference ?? null,
             tariff_code: order.tariff_code ?? '',
             option_name: order.option_name ?? '',
             customer_name: custProfile?.full_name ?? 'Customer',
             customer_avatar: custProfile?.avatar_url ?? '',
-
             items: itemsForNotif,
-
             receiver_name: order.receiver_name ?? '',
             receiver_phone: order.receiver_phone ?? '',
             sender_name: order.sender_name ?? '',
@@ -758,133 +1107,119 @@ export const orderService = {
             package_type: order.package_type ?? '',
             package_size: order.package_size ?? '',
             package_weight: order.package_weight ?? '',
+            accept_expires_at: order.accept_expires_at ?? null,
         };
 
-        // ═══════════════════════════════════════════════════════════
-        // ✅ NOTIFIKASI (pakai copy module per layanan)
-        // ═══════════════════════════════════════════════════════════
-        const kind = kindOf(input.type);
-        const itemCount = itemsForNotif.length;
+        const driverCopyBase = {
+            kind,
+            pickup: pickupShort,
+            dropoff: dropoffShort,
+            jarak: jarakText,
+            fare: fareText,
+            itemCount: itemsForNotif.length,
+        };
 
         if (autobidDriver) {
-            // ── Autobid berhasil ──
-            const driverCopy = newOrderForDriver({
-                kind,
-                pickup: pickupShort,
-                dropoff: dropoffShort,
-                jarak: jarakText,
-                fare: fareText,
-                itemCount,
-                autobid: true,
-            });
+            const driverCopy = newOrderForDriver({ ...driverCopyBase, autobid: true });
 
-            try {
-                await notificationService.sendToUser(autobidDriver, {
+            await notificationService
+                .sendToUser(autobidDriver, {
                     title: driverCopy.title,
                     body: driverCopy.body,
                     data: {
                         order_id: String(order.id),
                         type: 'autobid_accepted',
-                        tariff_code: tariffCode ?? '',
-                        service: input.type,
-                        order: JSON.stringify(orderPayloadForNotif),
+                        tariff_code: order.tariff_code ?? '',
+                        service: order.type,
+                        order: JSON.stringify(orderPayload),
                     },
-                });
+                })
+                .catch((err: any) =>
+                    logger.warn('[order.dispatch] Gagal notif autobid', {
+                        orderId,
+                        err: err.message,
+                    })
+                );
 
-                logger.info('[order.create] Notif autobid terkirim', {
-                    orderId: order.id,
-                    driverId: autobidDriver,
-                });
-            } catch (err: any) {
-                logger.warn('[order.create] Gagal notif autobid', {
-                    driverId: autobidDriver,
-                    err: err.message,
-                });
-            }
-
-            // Notif ke customer — driver sudah dapat
             const customerCopy = driverFoundForCustomer({
                 kind,
                 pickup: pickupShort,
                 driverName: null,
             });
-
-            try {
-                await notificationService.sendToUser(customerId, {
+            await notificationService
+                .sendToUser(order.customer_id, {
                     title: customerCopy.title,
                     body: customerCopy.body,
                     data: {
                         order_id: order.id,
                         type: 'driver_accepted',
-                        service: input.type,
+                        service: order.type,
                     },
-                });
-            } catch (err: any) {
-                logger.warn('[order.create] Gagal notif customer', {
-                    customerId,
-                    err: err.message,
-                });
-            }
-        } else {
-            // ── Normal flow → broadcast ke semua driver ──
-            const driverCopy = newOrderForDriver({
-                kind,
-                pickup: pickupShort,
-                dropoff: dropoffShort,
-                jarak: jarakText,
-                fare: fareText,
-                itemCount,
-                autobid: false,
-            });
+                })
+                .catch(() => { });
 
-            for (const d of drivers) {
-                try {
-                    await notificationService.sendToUser(d.user_id, {
+            await orderService.notifyMerchantDriverAssigned(order);
+        } else {
+            const driverCopy = newOrderForDriver({ ...driverCopyBase, autobid: false });
+
+            const results = await Promise.allSettled(
+                drivers.map((d) =>
+                    notificationService.sendToUser(d.user_id, {
                         title: driverCopy.title,
                         body: driverCopy.body,
                         data: {
                             order_id: String(order.id),
                             type: 'new_order',
-                            tariff_code: tariffCode ?? '',
-                            service: input.type,
-                            order: JSON.stringify(orderPayloadForNotif),
+                            tariff_code: order.tariff_code ?? '',
+                            service: order.type,
+                            order: JSON.stringify(orderPayload),
                         },
-                    });
-                    logger.info('[order.create] Notif driver terkirim', {
-                        orderId: order.id,
-                        driverId: d.user_id,
-                    });
-                } catch (err: any) {
-                    logger.warn('[order.create] Gagal kirim notif ke driver', {
-                        driverId: d.user_id,
-                        err: err.message,
-                    });
-                }
-            }
+                    })
+                )
+            );
 
-            // Kalau tidak ada driver, kabari customer
-            if (drivers.length === 0) {
-                const searching = searchingForCustomer(kind);
-                try {
-                    await notificationService.sendToUser(customerId, {
-                        title: searching.title,
-                        body: searching.body,
-                        data: {
-                            order_id: order.id,
-                            type: 'no_driver_yet',
-                            service: input.type,
-                        },
-                    });
-                } catch (err: any) {
-                    logger.warn(
-                        '[order.create] Gagal kirim notif ke customer',
-                        { customerId, err: err.message }
-                    );
-                }
-            }
+            const failed = results.filter((r) => r.status === 'rejected').length;
+            logger.info('[order.dispatch] Broadcast ke driver', {
+                orderId,
+                total: drivers.length,
+                failed,
+            });
         }
 
-        return await orderService.getById(order.id, customerId, 'customer');
+        logger.info('[order.dispatch] ✅ DONE', { orderId });
+    },
+
+    async notifyMerchantDriverAssigned(order: any, driverName?: string | null) {
+        if (order.type !== 'food' || !order.merchant_id) return;
+        await notificationService
+            .sendToUser(order.merchant_id, {
+                title: 'Driver menuju tokomu 🛵',
+                body: driverName
+                    ? `${driverName} akan mengambil pesanan ${order.order_code}`
+                    : `Driver akan mengambil pesanan ${order.order_code}`,
+                data: {
+                    order_id: String(order.id),
+                    type: 'driver_assigned',
+                    service: 'food',
+                },
+            })
+            .catch((err: any) =>
+                logger.warn('[order] Gagal notif merchant (driver assigned)', {
+                    orderId: order.id,
+                    err: err.message,
+                })
+            );
+    },
+
+    flagRefundIfPaid(order: any) {
+        if (order?.payment_status === 'paid' && order.payment_method !== 'cash') {
+            logger.error('[order] PERLU REFUND — order dibatalkan setelah dibayar', {
+                orderId: order.id,
+                method: order.payment_method,
+                amount: order.total_fare,
+                customerId: order.customer_id,
+            });
+        }
     },
 
     // ============================================================
@@ -906,6 +1241,13 @@ export const orderService = {
                 status: order.status,
             });
             throw ApiError.conflict('Order already taken');
+        }
+        if (
+            order.type === 'food' &&
+            order.merchant_id &&
+            order.merchant_status !== 'accepted'
+        ) {
+            throw ApiError.conflict('Pesanan belum diterima toko');
         }
 
         const { data: bid } = await supabaseAdmin
@@ -958,10 +1300,7 @@ export const orderService = {
             .single();
 
         if (error || !data) {
-            logger.warn('[order.accept] Race condition', {
-                orderId,
-                driverId,
-            });
+            logger.warn('[order.accept] Race condition', { orderId, driverId });
             throw ApiError.conflict('Order already taken by another driver');
         }
 
@@ -995,9 +1334,6 @@ export const orderService = {
             .update({ status: 'busy' })
             .eq('user_id', driverId);
 
-        // ═══════════════════════════════════════════════════════════
-        // ✅ NOTIF ke customer — pakai copy module
-        // ═══════════════════════════════════════════════════════════
         const { data: driverProfile } = await supabaseAdmin
             .from('profiles')
             .select('full_name')
@@ -1044,12 +1380,14 @@ export const orderService = {
             });
         }
 
+        await orderService.notifyMerchantDriverAssigned(
+            order,
+            firstName(driverProfile?.full_name)
+        );
+
         return data;
     },
 
-    /**
-     * Trigger matching driver setelah payment paid (QRIS/VA).
-     */
     async triggerMatchingAfterPayment(orderId: number) {
         logger.info('[order.triggerMatching] START', { orderId });
 
@@ -1060,12 +1398,9 @@ export const orderService = {
             .single();
 
         if (!order) {
-            logger.warn('[order.triggerMatching] Order tidak ditemukan', {
-                orderId,
-            });
+            logger.warn('[order.triggerMatching] Order tidak ditemukan', { orderId });
             return;
         }
-
         if (order.status !== 'pending') {
             logger.warn('[order.triggerMatching] Order tidak pending, skip', {
                 orderId,
@@ -1073,246 +1408,15 @@ export const orderService = {
             });
             return;
         }
-
         if (order.payment_status !== 'paid') {
-            logger.warn(
-                '[order.triggerMatching] Payment belum paid, skip',
-                {
-                    orderId,
-                    paymentStatus: order.payment_status,
-                }
-            );
-            return;
-        }
-
-        const pickupCoords = parseLocation(order.pickup_location);
-        if (!pickupCoords) {
-            logger.error('[order.triggerMatching] Pickup coords invalid', {
+            logger.warn('[order.triggerMatching] Payment belum paid, skip', {
                 orderId,
+                paymentStatus: order.payment_status,
             });
             return;
         }
 
-        const drivers = await matchingService.findDriversForOrder(
-            order.id,
-            pickupCoords.latitude,
-            pickupCoords.longitude,
-            order.type,
-            order.tariff_code
-        );
-
-        logger.info('[order.triggerMatching] Driver ditemukan', {
-            orderId,
-            driverCount: drivers.length,
-        });
-
-        if (drivers.length === 0) {
-            logger.warn('[order.triggerMatching] Tidak ada driver', {
-                orderId,
-            });
-            return;
-        }
-
-        let autobidDriver: string | null = null;
-        try {
-            const { autobidService } = await import('./autobid.service');
-            autobidDriver = await autobidService.tryAutoBid(
-                order.id,
-                {
-                    type: order.type,
-                    driver_earning: Number(order.driver_earning),
-                    distance_km: Number(order.distance_km),
-                },
-                drivers.map((d) => d.user_id)
-            );
-
-            if (autobidDriver) {
-                logger.info('[order.triggerMatching] ✅ Autobid sukses', {
-                    orderId,
-                    driverId: autobidDriver,
-                });
-            }
-        } catch (err: any) {
-            logger.warn('[order.triggerMatching] Autobid error', {
-                orderId,
-                error: err.message,
-            });
-        }
-
-        const { data: custProfile } = await supabaseAdmin
-            .from('profiles')
-            .select('full_name, avatar_url')
-            .eq('id', order.customer_id)
-            .maybeSingle();
-
-        const pickupShort = prettyPlace(order.pickup_name);
-        const dropoffShort = prettyPlace(order.dropoff_name);
-        const jarakText =
-            Number(order.distance_km) < 1
-                ? `${Math.round(Number(order.distance_km) * 1000)} m`
-                : `${Number(order.distance_km).toFixed(1)} km`;
-        const fareText = `Rp${Number(order.delivery_fee).toLocaleString(
-            'id-ID'
-        )}`;
-
-        let itemsForNotif: any[] = [];
-        if (order.type === 'food') {
-            const { data: orderItems } = await supabaseAdmin
-                .from('order_items')
-                .select('menu_item_id, name, variant, qty, price')
-                .eq('order_id', order.id);
-            itemsForNotif = orderItems ?? [];
-        }
-
-        const orderPayloadForNotif = {
-            id: String(order.id),
-            order_code: order.order_code,
-            type: order.type,
-            status: order.status,
-            pickup_name: order.pickup_name ?? '',
-            pickup_address: order.pickup_address ?? '',
-            pickup_coords: pickupCoords,
-            dropoff_name: order.dropoff_name ?? '',
-            dropoff_address: order.dropoff_address ?? '',
-            dropoff_coords: parseLocation(order.dropoff_location),
-            distance_km: String(order.distance_km ?? 0),
-            duration_min: String(order.duration_min ?? 0),
-            delivery_fee: String(order.delivery_fee ?? 0),
-            driver_earning: String(order.driver_earning ?? 0),
-            total_fare: String(order.total_fare ?? 0),
-            subtotal: String(order.subtotal ?? 0),
-            payment_method: order.payment_method ?? 'cash',
-            payment_status: 'paid',
-            payment_reference: order.payment_reference ?? null,
-            tariff_code: order.tariff_code ?? '',
-            option_name: order.option_name ?? '',
-            customer_name: custProfile?.full_name ?? 'Customer',
-            customer_avatar: custProfile?.avatar_url ?? '',
-            items: itemsForNotif,
-            receiver_name: order.receiver_name ?? '',
-            receiver_phone: order.receiver_phone ?? '',
-            sender_name: order.sender_name ?? '',
-            sender_phone: order.sender_phone ?? '',
-            package_type: order.package_type ?? '',
-            package_size: order.package_size ?? '',
-            package_weight: order.package_weight ?? '',
-        };
-
-        // ═══════════════════════════════════════════════════════════
-        // ✅ NOTIFIKASI (pakai copy module per layanan)
-        // ═══════════════════════════════════════════════════════════
-        const kind = kindOf(order.type);
-        const itemCount = itemsForNotif.length;
-
-        if (autobidDriver) {
-            const driverCopy = newOrderForDriver({
-                kind,
-                pickup: pickupShort,
-                dropoff: dropoffShort,
-                jarak: jarakText,
-                fare: fareText,
-                itemCount,
-                autobid: true,
-            });
-
-            try {
-                await notificationService.sendToUser(autobidDriver, {
-                    title: driverCopy.title,
-                    body: driverCopy.body,
-                    data: {
-                        order_id: String(order.id),
-                        type: 'autobid_accepted',
-                        tariff_code: order.tariff_code ?? '',
-                        service: order.type,
-                        order: JSON.stringify(orderPayloadForNotif),
-                    },
-                });
-                logger.info(
-                    '[order.triggerMatching] Notif autobid terkirim',
-                    {
-                        orderId,
-                        driverId: autobidDriver,
-                    }
-                );
-            } catch (err: any) {
-                logger.warn(
-                    '[order.triggerMatching] Gagal notif autobid',
-                    {
-                        orderId,
-                        err: err.message,
-                    }
-                );
-            }
-
-            const customerCopy = driverFoundForCustomer({
-                kind,
-                pickup: pickupShort,
-                driverName: null,
-            });
-
-            try {
-                await notificationService.sendToUser(order.customer_id, {
-                    title: customerCopy.title,
-                    body: customerCopy.body,
-                    data: {
-                        order_id: order.id,
-                        type: 'driver_accepted',
-                        service: order.type,
-                    },
-                });
-            } catch (err: any) {
-                logger.warn(
-                    '[order.triggerMatching] Gagal notif customer',
-                    {
-                        orderId,
-                        err: err.message,
-                    }
-                );
-            }
-        } else {
-            const driverCopy = newOrderForDriver({
-                kind,
-                pickup: pickupShort,
-                dropoff: dropoffShort,
-                jarak: jarakText,
-                fare: fareText,
-                itemCount,
-                autobid: false,
-            });
-
-            for (const d of drivers) {
-                try {
-                    await notificationService.sendToUser(d.user_id, {
-                        title: driverCopy.title,
-                        body: driverCopy.body,
-                        data: {
-                            order_id: String(order.id),
-                            type: 'new_order',
-                            tariff_code: order.tariff_code ?? '',
-                            service: order.type,
-                            order: JSON.stringify(orderPayloadForNotif),
-                        },
-                    });
-                    logger.info(
-                        '[order.triggerMatching] Notif driver terkirim',
-                        {
-                            orderId,
-                            driverId: d.user_id,
-                        }
-                    );
-                } catch (err: any) {
-                    logger.warn(
-                        '[order.triggerMatching] Gagal notif driver',
-                        {
-                            orderId,
-                            driverId: d.user_id,
-                            err: err.message,
-                        }
-                    );
-                }
-            }
-        }
-
+        await orderService.onOrderReady(order);
         logger.info('[order.triggerMatching] ✅ DONE', { orderId });
     },
 
@@ -1333,6 +1437,12 @@ export const orderService = {
             newStatus: status,
         });
 
+        if (status === 'accepted' && role !== 'admin') {
+            throw ApiError.badRequest(
+                'Gunakan endpoint accept untuk menerima order'
+            );
+        }
+
         const { data: order } = await supabaseAdmin
             .from('orders')
             .select('*')
@@ -1344,10 +1454,7 @@ export const orderService = {
         const isDriver = order.driver_id === userId;
         const isMerchant = order.merchant_id === userId;
         if (!isCustomer && !isDriver && !isMerchant && role !== 'admin') {
-            logger.warn('[order.updateStatus] Akses ditolak', {
-                orderId,
-                userId,
-            });
+            logger.warn('[order.updateStatus] Akses ditolak', { orderId, userId });
             throw ApiError.forbidden();
         }
 
@@ -1358,9 +1465,12 @@ export const orderService = {
                     userId,
                     status,
                 });
-                throw ApiError.forbidden(
-                    'Merchant hanya dapat membatalkan pesanan'
-                );
+                throw ApiError.forbidden('Merchant hanya dapat membatalkan pesanan');
+            }
+            if (order.status === 'pending' && order.merchant_status === 'waiting') {
+                return await orderService.merchantRespond(orderId, userId, false, {
+                    reason,
+                });
             }
             if (order.status !== 'pending' && order.status !== 'accepted') {
                 throw ApiError.badRequest(
@@ -1370,24 +1480,13 @@ export const orderService = {
         }
 
         if (order.status === 'cancelled') {
-            logger.warn('[order.updateStatus] Order sudah cancelled', {
-                orderId,
-                oldStatus: order.status,
-                newStatus: status,
-            });
             throw ApiError.conflict('Order sudah dibatalkan');
         }
         if (order.status === 'completed') {
-            logger.warn('[order.updateStatus] Order sudah completed', {
-                orderId,
-                oldStatus: order.status,
-                newStatus: status,
-            });
             throw ApiError.conflict('Order sudah selesai');
         }
 
-        const allowedTransitions =
-            VALID_STATUS_TRANSITIONS[order.status] ?? [];
+        const allowedTransitions = VALID_STATUS_TRANSITIONS[order.status] ?? [];
         if (!allowedTransitions.includes(status)) {
             logger.warn('[order.updateStatus] Transisi tidak sah', {
                 orderId,
@@ -1406,13 +1505,6 @@ export const orderService = {
             role !== 'admin' &&
             order.status === 'in_progress'
         ) {
-            logger.warn(
-                '[order.updateStatus] Driver cancel saat in_progress',
-                {
-                    orderId,
-                    driverId: userId,
-                }
-            );
             throw ApiError.badRequest(
                 'Tidak bisa cancel saat perjalanan sudah dimulai'
             );
@@ -1420,10 +1512,8 @@ export const orderService = {
 
         const patch: any = { status };
         if (status === 'arrived') patch.arrived_at = new Date().toISOString();
-        if (status === 'in_progress')
-            patch.started_at = new Date().toISOString();
-        if (status === 'completed')
-            patch.completed_at = new Date().toISOString();
+        if (status === 'in_progress') patch.started_at = new Date().toISOString();
+        if (status === 'completed') patch.completed_at = new Date().toISOString();
         if (status === 'cancelled') {
             patch.cancelled_at = new Date().toISOString();
             patch.cancellation_reason = reason;
@@ -1454,6 +1544,10 @@ export const orderService = {
             to: status,
         });
 
+        if (status === 'cancelled') {
+            orderService.flagRefundIfPaid(order);
+        }
+
         if (
             (status === 'completed' || status === 'cancelled') &&
             order.driver_id
@@ -1463,11 +1557,6 @@ export const orderService = {
                 .update({ status: 'online' })
                 .eq('user_id', order.driver_id);
 
-            logger.info('[order.updateStatus] Driver online kembali', {
-                driverId: order.driver_id,
-                reason: status,
-            });
-
             await supabaseAdmin
                 .from('order_bids')
                 .update({
@@ -1476,11 +1565,17 @@ export const orderService = {
                 })
                 .eq('order_id', orderId)
                 .eq('status', 'pending');
+        }
 
-            logger.info('[order.updateStatus] Bids cleaned up', {
-                orderId,
-                status,
-            });
+        if (status === 'cancelled' && !order.driver_id) {
+            await supabaseAdmin
+                .from('order_bids')
+                .update({
+                    status: 'expired',
+                    responded_at: new Date().toISOString(),
+                })
+                .eq('order_id', orderId)
+                .eq('status', 'pending');
         }
 
         if (status === 'completed' && order.driver_id) {
@@ -1494,36 +1589,11 @@ export const orderService = {
                 .from('driver_profiles')
                 .update({ total_trips: tripsCount ?? 0 })
                 .eq('user_id', order.driver_id);
-
-            logger.info('[order.updateStatus] total_trips updated', {
-                driverId: order.driver_id,
-                total_trips: tripsCount,
-            });
-        }
-
-        if (status === 'cancelled' && order.driver_id) {
-            logger.info(
-                '[order.updateStatus] Order cancelled — notify via push',
-                {
-                    orderId,
-                    driverId: order.driver_id,
-                    cancelledBy: isDriver
-                        ? 'driver'
-                        : isCustomer
-                            ? 'customer'
-                            : isMerchant
-                                ? 'merchant'
-                                : 'admin',
-                }
-            );
         }
 
         if (status === 'completed' && order.driver_id) {
             try {
-                const { walletService } = await import(
-                    '../wallet/wallet.service'
-                );
-
+                const { walletService } = await import('../wallet/wallet.service');
                 const settlement = await walletService.settleOrder(orderId);
 
                 logger.info('[order.updateStatus] Wallet settled', {
@@ -1540,9 +1610,6 @@ export const orderService = {
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // ✅ NOTIFIKASI (pakai copy module per layanan)
-        // ═══════════════════════════════════════════════════════════
         const { data: orderCustomerProfile } = await supabaseAdmin
             .from('profiles')
             .select('full_name')
@@ -1550,22 +1617,18 @@ export const orderService = {
             .maybeSingle();
 
         const customerFirstName = firstName(orderCustomerProfile?.full_name);
-
         const dropoffShort = prettyPlace(order.dropoff_name);
         const pickupShort = prettyPlace(order.pickup_name);
 
-        const senderName = await (async () => {
-            const { data: p } = await supabaseAdmin
-                .from('profiles')
-                .select('full_name, role')
-                .eq('id', userId)
-                .maybeSingle();
-            return p;
-        })();
+        const { data: sender } = await supabaseAdmin
+            .from('profiles')
+            .select('full_name, role')
+            .eq('id', userId)
+            .maybeSingle();
 
-        const senderIsDriver = senderName?.role === 'driver';
-        const senderIsCustomer = senderName?.role === 'customer';
-        const senderFirstName = firstName(senderName?.full_name);
+        const senderIsDriver = sender?.role === 'driver';
+        const senderIsCustomer = sender?.role === 'customer';
+        const senderFirstName = firstName(sender?.full_name);
 
         const kind = kindOf(order.type);
 
@@ -1577,13 +1640,10 @@ export const orderService = {
 
         for (const uid of notifyTargets) {
             try {
-                const isTargetCustomer = uid === order.customer_id;
-                const isTargetDriver = uid === order.driver_id;
-
                 const target: 'customer' | 'driver' | 'merchant' =
-                    isTargetCustomer
+                    uid === order.customer_id
                         ? 'customer'
-                        : isTargetDriver
+                        : uid === order.driver_id
                             ? 'driver'
                             : 'merchant';
 
@@ -1695,8 +1755,7 @@ export const orderService = {
         }
 
         let driverProfile: any = null;
-        let driverCoords: { latitude: number; longitude: number } | null =
-            null;
+        let driverCoords: Coords | null = null;
 
         if (order.driver_id) {
             const { data: dp } = await supabaseAdmin
@@ -1733,13 +1792,10 @@ export const orderService = {
             }
             : null;
 
-        const pickupCoords = parseLocation(order.pickup_location);
-        const dropoffCoords = parseLocation(order.dropoff_location);
-
         return {
             ...order,
-            pickup_coords: pickupCoords,
-            dropoff_coords: dropoffCoords,
+            pickup_coords: parseLocation(order.pickup_location),
+            dropoff_coords: parseLocation(order.dropoff_location),
             customer,
             driver,
             merchant: merchantRes.data,
@@ -1756,10 +1812,50 @@ export const orderService = {
         limit = 50,
         offset = 0
     ) {
+        const withItems = (rows: any[]) =>
+            rows.map((o) => ({ ...o, items: o.order_items ?? [] }));
+
+        const attachDrivers = async (rows: any[]) => {
+            const ids = Array.from(
+                new Set(rows.map((o) => o.driver_id).filter(Boolean))
+            ) as string[];
+            if (ids.length === 0) return rows;
+
+            const [profRes, dpRes] = await Promise.all([
+                supabaseAdmin
+                    .from('profiles')
+                    .select('id, full_name, phone, avatar_url')
+                    .in('id', ids),
+                supabaseAdmin
+                    .from('driver_profiles')
+                    .select('user_id, plate_number, vehicle_brand, vehicle_type')
+                    .in('user_id', ids),
+            ]);
+
+            const pMap = new Map<string, any>(
+                (profRes.data ?? []).map((p: any) => [p.id, p])
+            );
+            const dMap = new Map<string, any>(
+                (dpRes.data ?? []).map((d: any) => [d.user_id, d])
+            );
+
+            return rows.map((o) =>
+                o.driver_id
+                    ? {
+                        ...o,
+                        driver: {
+                            ...(pMap.get(o.driver_id) ?? {}),
+                            ...(dMap.get(o.driver_id) ?? {}),
+                        },
+                    }
+                    : o
+            );
+        };
+
         let query = supabaseAdmin
             .from('orders')
             .select(
-                '*, customer:profiles!orders_customer_id_fkey(id, full_name, phone, avatar_url)'
+                '*, order_items(*), customer:profiles!orders_customer_id_fkey(id, full_name, phone, avatar_url)'
             )
             .order('created_at', { ascending: false })
             .range(offset, offset + limit - 1);
@@ -1780,22 +1876,19 @@ export const orderService = {
 
             let fallback = supabaseAdmin
                 .from('orders')
-                .select('*')
+                .select('*, order_items(*)')
                 .order('created_at', { ascending: false })
                 .range(offset, offset + limit - 1);
 
-            if (role === 'customer')
-                fallback = fallback.eq('customer_id', userId);
-            else if (role === 'driver')
-                fallback = fallback.eq('driver_id', userId);
-            else if (role === 'merchant')
-                fallback = fallback.eq('merchant_id', userId);
+            if (role === 'customer') fallback = fallback.eq('customer_id', userId);
+            else if (role === 'driver') fallback = fallback.eq('driver_id', userId);
+            else if (role === 'merchant') fallback = fallback.eq('merchant_id', userId);
             if (status) fallback = fallback.eq('status', status);
 
             const { data: f } = await fallback;
-            return f || [];
+            return attachDrivers(withItems(f || []));
         }
-        return data || [];
+        return attachDrivers(withItems(data || []));
     },
 
     // ============================================================
@@ -1814,9 +1907,7 @@ export const orderService = {
 
         const { data: orderRaw, error: oErr } = await supabaseAdmin
             .from('orders')
-            .select(
-                'id, type, status, driver_id, customer_id, package_photo_url'
-            )
+            .select('id, type, status, driver_id, customer_id, package_photo_url')
             .eq('id', orderId)
             .single();
 
@@ -1833,10 +1924,6 @@ export const orderService = {
             throw ApiError.badRequest('Foto paket hanya untuk order send');
         }
         if (order.status !== 'accepted' && order.status !== 'arrived') {
-            logger.warn('[order.uploadPhoto] Status tidak valid', {
-                orderId,
-                status: order.status,
-            });
             throw ApiError.badRequest(
                 'Foto paket hanya bisa diupload saat order aktif'
             );

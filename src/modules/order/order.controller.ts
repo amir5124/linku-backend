@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { orderService } from './order.service';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created } from '../../utils/response';
-import { ApiError } from '@/utils/ApiError';
+import { ApiError } from '../../utils/ApiError';
 
 export const orderController = {
     create: asyncHandler(async (req: Request, res: Response) => {
@@ -18,10 +18,40 @@ export const orderController = {
         return ok(res, data, 'Order accepted');
     }),
 
+    // ⬇️ BARU: toko menerima pesanan makanan
+    merchantAccept: asyncHandler(async (req: Request, res: Response) => {
+        const data = await orderService.merchantRespond(
+            Number(req.params.id),
+            req.user!.id,
+            true,
+            { prep_minutes: req.body?.prep_minutes }
+        );
+        return ok(res, data, 'Pesanan diterima toko');
+    }),
+
+    // ⬇️ BARU: toko menolak pesanan makanan
+    merchantReject: asyncHandler(async (req: Request, res: Response) => {
+        const data = await orderService.merchantRespond(
+            Number(req.params.id),
+            req.user!.id,
+            false,
+            { reason: req.body?.reason }
+        );
+        return ok(res, data, 'Pesanan ditolak toko');
+    }),
+
+    merchantReady: asyncHandler(async (req: Request, res: Response) => {
+        const data = await orderService.merchantMarkReady(
+            Number(req.params.id),
+            req.user!.id
+        );
+        return ok(res, data, 'Pesanan ditandai siap');
+    }),
+
     updateStatus: asyncHandler(async (req: Request, res: Response) => {
         const orderId = Number(req.params.id);
 
-        // ⬇️ Validasi send_code sebelum completed
+        // Validasi send_code sebelum completed
         if (req.body.status === 'completed') {
             const order = await orderService.getById(
                 orderId,

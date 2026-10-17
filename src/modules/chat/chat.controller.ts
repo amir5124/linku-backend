@@ -24,6 +24,15 @@ export const chatController = {
         return ok(res, data);
     }),
 
+    // 🆕 Status room: kapan chat ditutup
+    roomStatus: asyncHandler(async (req: Request, res: Response) => {
+        const data = await chatService.roomStatus(
+            Number(req.params.roomId),
+            req.user!.id
+        );
+        return ok(res, data);
+    }),
+
     // ============================================================
     // MESSAGES
     // ============================================================

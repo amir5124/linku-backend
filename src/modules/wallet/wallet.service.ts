@@ -174,11 +174,7 @@ class WalletService {
     }
 
     // ============================================================
-    // SETTLE ORDER
-    // ============================================================
-    // src/modules/wallet/wallet.service.ts
-    // ============================================================
-    // SETTLE ORDER — FINAL (Fixed)
+    // SETTLE ORDER — FINAL (Fixed: auto-lunasi utang dari saldo aktif)
     // ============================================================
     async settleOrder(orderId: number) {
         // ────────────────────────────────────────────────────────
@@ -187,13 +183,13 @@ class WalletService {
         const { data: orderRaw, error: oErr } = await supabaseAdmin
             .from('orders')
             .select(`
-                id, type, status, driver_id, customer_id,
-                delivery_fee, driver_earning, total_fare,
-                subtotal, packaging_fee, merchant_earning,
-                tariff_code, payment_method, payment_status,
-                settled_at, commission_amount, commission_rate,
-                platform_earning, settlement_type
-            `)
+            id, type, status, driver_id, customer_id,
+            delivery_fee, driver_earning, total_fare,
+            subtotal, packaging_fee, merchant_earning,
+            tariff_code, payment_method, payment_status,
+            settled_at, commission_amount, commission_rate,
+            platform_earning, settlement_type
+        `)
             .eq('id', orderId)
             .single();
 
@@ -277,8 +273,10 @@ class WalletService {
         // 5. Bangun ledger entries berdasarkan metode pembayaran
         // ────────────────────────────────────────────────────────
         if (isCash) {
+            // ══════════════════════════════════════════════════════
             // ── CASH ──
             // Komisi jadi UTANG driver ke platform. Balance tidak berubah.
+            // ══════════════════════════════════════════════════════
             newCashDebt = newCashDebt + commissionAmount;
 
             ledgerEntries.push({
@@ -315,18 +313,43 @@ class WalletService {
                 },
             });
         } else {
+            // ══════════════════════════════════════════════════════
             // ── GATEWAY (qris / va / wallet) ──
-            // Uang sudah masuk ke platform. Lunasi utang cash dulu.
+            // ✅ FIXED: Lunasi utang cash pakai SALDO AKTIF dulu,
+            //    baru pakai EARNING order ini. Sisanya masuk saldo.
+            //
+            // Alur:
+            // 1. Cek saldo aktif → pakai untuk lunasi utang (jika ada)
+            // 2. Jika masih ada utang → pakai earning order
+            // 3. Sisa earning → masuk saldo aktif
+            // ══════════════════════════════════════════════════════
             const netEarning = driverEarning;
 
-            let debtPaid = 0;
-            if (newCashDebt > 0) {
-                debtPaid = Math.min(newCashDebt, netEarning);
-                newCashDebt = newCashDebt - debtPaid;
-            }
-            const balanceCredit = netEarning - debtPaid;
-            newBalance = newBalance + balanceCredit;
+            let debtPaidFromBalance = 0;
+            let debtPaidFromEarning = 0;
 
+            if (newCashDebt > 0) {
+                // 1️⃣ Coba lunasi dari SALDO AKTIF dulu
+                if (newBalance > 0) {
+                    debtPaidFromBalance = Math.min(newCashDebt, newBalance);
+                    newBalance -= debtPaidFromBalance;
+                    newCashDebt -= debtPaidFromBalance;
+                }
+
+                // 2️⃣ Kalau masih ada utang, lunasi dari EARNING order ini
+                if (newCashDebt > 0) {
+                    debtPaidFromEarning = Math.min(newCashDebt, netEarning);
+                    newCashDebt -= debtPaidFromEarning;
+                }
+            }
+
+            // 3️⃣ Sisa earning setelah pelunasan → masuk saldo
+            const balanceCredit = netEarning - debtPaidFromEarning;
+            newBalance += balanceCredit;
+
+            const totalDebtPaid = debtPaidFromBalance + debtPaidFromEarning;
+
+            // ── Ledger: earning gateway ──
             ledgerEntries.push({
                 driver_id: order.driver_id,
                 order_id: order.id,
@@ -341,21 +364,58 @@ class WalletService {
                     commission_base: commissionBase,
                     commission_amount: commissionAmount,
                     net_earning: netEarning,
+                    debt_paid_from_balance: debtPaidFromBalance,
+                    debt_paid_from_earning: debtPaidFromEarning,
                     ...foodMeta,
                 },
             });
 
-            if (debtPaid > 0) {
+            // ── Ledger: pelunasan utang dari saldo aktif ──
+            if (debtPaidFromBalance > 0) {
                 ledgerEntries.push({
                     driver_id: order.driver_id,
                     order_id: order.id,
                     entry_type: 'debt_payment',
-                    amount: debtPaid,
+                    amount: debtPaidFromBalance,
+                    direction: 'out',
+                    balance_after: newBalance + balanceCredit, // sebelum kredit earning
+                    cash_debt_after: newCashDebt + debtPaidFromEarning,
+                    description: `Pelunasan utang cash dari saldo aktif`,
+                    metadata: {
+                        source: 'balance',
+                        debt_paid: debtPaidFromBalance,
+                    },
+                });
+            }
+
+            // ── Ledger: pelunasan utang dari earning order ──
+            if (debtPaidFromEarning > 0) {
+                ledgerEntries.push({
+                    driver_id: order.driver_id,
+                    order_id: order.id,
+                    entry_type: 'debt_payment',
+                    amount: debtPaidFromEarning,
                     direction: 'out',
                     balance_after: newBalance,
                     cash_debt_after: newCashDebt,
-                    description: `Pelunasan utang cash`,
-                    metadata: { debt_paid: debtPaid },
+                    description: `Pelunasan utang cash dari pendapatan order`,
+                    metadata: {
+                        source: 'earning',
+                        debt_paid: debtPaidFromEarning,
+                    },
+                });
+            }
+
+            // ── Log untuk audit ──
+            if (totalDebtPaid > 0) {
+                logger.info('Auto-lunasi utang cash saat order gateway', {
+                    orderId: order.id,
+                    driverId: order.driver_id,
+                    debtPaidFromBalance,
+                    debtPaidFromEarning,
+                    totalDebtPaid,
+                    remainingDebt: newCashDebt,
+                    newBalance,
                 });
             }
         }
@@ -624,7 +684,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
+                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -650,7 +710,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
+                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1043,7 +1103,7 @@ class WalletService {
             inquiry_reff: inquiryReff,
             signature,
             remark: 'Withdraw Mitra',
-            url_callback: 'https://linku.siappgo.id/api/wallet/callback',
+            url_callback: 'https://warung.siappgo.id/api/wallet/callback',
         };
 
         try {
@@ -1430,7 +1490,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
+                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1457,7 +1517,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://linku.siappgo.id/api/wallet/callback',
+                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,

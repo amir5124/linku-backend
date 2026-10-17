@@ -2,11 +2,13 @@ import { Router } from 'express';
 import { orderController } from './order.controller';
 import { requireAuth, requireRole } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
-import { createOrderSchema, updateStatusSchema } from './order.schema';
+import {
+    createOrderSchema,
+    updateStatusSchema,
+    merchantAcceptSchema,
+    merchantRejectSchema,
+} from './order.schema';
 import multer from 'multer';
-
-
-
 
 const router = Router();
 
@@ -27,6 +29,23 @@ router.use(requireAuth);
 
 router.post('/', requireRole('customer'), validate(createOrderSchema), orderController.create);
 router.post('/:id/accept', requireRole('driver'), orderController.accept);
+
+// ⬇️ BARU: respons toko (letakkan sebelum route '/:id' lain)
+router.post(
+    '/:id/merchant-accept',
+    requireRole('merchant'),
+    validate(merchantAcceptSchema),
+    orderController.merchantAccept
+);
+router.post(
+    '/:id/merchant-reject',
+    requireRole('merchant'),
+    validate(merchantRejectSchema),
+    orderController.merchantReject
+);
+
+router.post('/:id/merchant-ready', requireRole('merchant'), orderController.merchantReady);
+
 router.put('/:id/status', validate(updateStatusSchema), orderController.updateStatus);
 router.get('/:id', orderController.detail);
 router.get('/', orderController.list);

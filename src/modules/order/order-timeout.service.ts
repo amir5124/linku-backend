@@ -2,12 +2,16 @@
 import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';
+import { orderService } from './order.service';
 
 // ═══════════════════════════════════════════════════════════════
 // KONSTANTA TIMEOUT
 // ═══════════════════════════════════════════════════════════════
 
-/** Order cash/wallet tanpa driver → 5 menit */
+/** Toko tidak merespons pesanan makanan → 5 menit (dihitung dari merchant_notified_at) */
+const MERCHANT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Tidak ada driver → 5 menit (dihitung dari toko menerima, atau dari dibuat untuk non-food) */
 const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Order QRIS/VA belum dibayar → 15 menit */
@@ -20,25 +24,68 @@ let intervalRef: ReturnType<typeof setInterval> | null = null;
 // ═══════════════════════════════════════════════════════════════
 export const orderTimeoutService = {
     // ============================================================
-    // 1. AUTO-CANCEL ORDER PENDING (cash/wallet) — tanpa driver
+    // 0. TOKO TIDAK MERESPONS — auto-tolak
     // ============================================================
-    // ============================================================
-    // 1. AUTO-CANCEL ORDER CASH/WALLET — 5 menit tanpa driver
-    // ============================================================
-    async cancelStalePendingOrders() {
-        const cutoff = new Date(
-            Date.now() - PENDING_TIMEOUT_MS
-        ).toISOString();
+    async rejectUnansweredMerchantOrders() {
+        const cutoff = new Date(Date.now() - MERCHANT_TIMEOUT_MS).toISOString();
 
-        // ✅ Filter BENAR: hanya cash/wallet (payment_status bisa 'pending' atau 'paid')
-        //    Cash → payment_status = 'pending' (bayar ke driver)
-        //    Wallet → payment_status = 'paid' (potong saldo)
-        //    QRIS/VA TIDAK masuk sini (dihandle cancelStalePaymentOrders)
         const { data: stale, error } = await supabaseAdmin
             .from('orders')
-            .select('id, customer_id, type, payment_method, payment_status')
+            .select('id, merchant_id')
             .eq('status', 'pending')
-            .in('payment_method', ['cash', 'wallet'])   // ⬅️ INI YANG BENAR
+            .eq('merchant_status', 'waiting')
+            .lt('merchant_notified_at', cutoff);
+
+        if (error) {
+            logger.error('[orderTimeout] Gagal cari order menunggu toko', {
+                error: error.message,
+            });
+            return;
+        }
+        if (!stale || stale.length === 0) return;
+
+        logger.info('[orderTimeout] Auto-tolak order (toko diam)', {
+            count: stale.length,
+        });
+
+        for (const o of stale) {
+            try {
+                await orderService.merchantRespond(
+                    o.id,
+                    o.merchant_id,
+                    false,
+                    { reason: 'Toko tidak merespons' }
+                );
+            } catch (err: any) {
+                // konflik = toko sempat merespons, abaikan
+                logger.info('[orderTimeout] Auto-tolak dilewati', {
+                    orderId: o.id,
+                    err: err.message,
+                });
+            }
+        }
+    },
+
+    // ============================================================
+    // 1. TIDAK ADA DRIVER — auto-cancel
+    // ============================================================
+    // Mencakup: cash, wallet, DAN qris/va yang SUDAH dibayar
+    // (versi lama melewatkan qris/va paid sehingga uang bisa tertahan).
+    // Untuk food, hitungan mulai dari toko menerima (merchant_responded_at),
+    // bukan dari order dibuat. Order yang masih menunggu toko dilewati
+    // (ditangani rejectUnansweredMerchantOrders).
+    async cancelStalePendingOrders() {
+        const cutoffMs = Date.now() - PENDING_TIMEOUT_MS;
+        const cutoff = new Date(cutoffMs).toISOString();
+
+        const { data: candidates, error } = await supabaseAdmin
+            .from('orders')
+            .select(
+                'id, customer_id, merchant_id, type, payment_method, payment_status, created_at, merchant_status, merchant_responded_at, total_fare'
+            )
+            .eq('status', 'pending')
+            .is('driver_id', null)
+            .or('payment_method.in.(cash,wallet),payment_status.eq.paid')
             .lt('created_at', cutoff);
 
         if (error) {
@@ -47,49 +94,47 @@ export const orderTimeoutService = {
             });
             return;
         }
+        if (!candidates || candidates.length === 0) return;
 
-        if (!stale || stale.length === 0) return;
+        const stale = candidates.filter((o: any) => {
+            if (o.merchant_status === 'waiting') return false;
+            const ref = new Date(
+                o.merchant_responded_at ?? o.created_at
+            ).getTime();
+            return ref < cutoffMs;
+        });
+        if (stale.length === 0) return;
 
-        logger.info('[orderTimeout] Auto-cancel order stale (cash/wallet)', {
+        logger.info('[orderTimeout] Auto-cancel order tanpa driver', {
             count: stale.length,
         });
 
         for (const order of stale) {
             try {
-                const { data: updated, error: updateErr } =
-                    await supabaseAdmin
-                        .from('orders')
-                        .update({
-                            status: 'cancelled',
-                            cancelled_at: new Date().toISOString(),
-                            cancellation_reason:
-                                'Tidak ada driver yang menerima',
-                        })
-                        .eq('id', order.id)
-                        .eq('status', 'pending')
-                        .select('id')
-                        .maybeSingle();
+                const { data: updated, error: updateErr } = await supabaseAdmin
+                    .from('orders')
+                    .update({
+                        status: 'cancelled',
+                        cancelled_at: new Date().toISOString(),
+                        cancellation_reason: 'Tidak ada driver yang menerima',
+                    })
+                    .eq('id', order.id)
+                    .eq('status', 'pending')
+                    .select('id')
+                    .maybeSingle();
 
                 if (updateErr) {
-                    logger.warn(
-                        '[orderTimeout] Gagal update order stale',
-                        {
-                            orderId: order.id,
-                            err: updateErr.message,
-                        }
-                    );
+                    logger.warn('[orderTimeout] Gagal update order stale', {
+                        orderId: order.id,
+                        err: updateErr.message,
+                    });
                     continue;
                 }
+                if (!updated) continue; // sudah bukan pending
 
-                if (!updated) {
-                    logger.info(
-                        '[orderTimeout] Order sudah tidak pending, skip',
-                        { orderId: order.id }
-                    );
-                    continue;
-                }
+                // Tandai refund bila sudah dibayar
+                orderService.flagRefundIfPaid(order);
 
-                // Cleanup bid
                 await supabaseAdmin
                     .from('order_bids')
                     .update({
@@ -99,7 +144,6 @@ export const orderTimeoutService = {
                     .eq('order_id', order.id)
                     .eq('status', 'pending');
 
-                // Notif ke customer
                 await notificationService
                     .sendToUser(order.customer_id, {
                         title: 'Pesanan dibatalkan',
@@ -111,23 +155,27 @@ export const orderTimeoutService = {
                             service: order.type,
                         },
                     })
-                    .catch((e) =>
-                        logger.warn(
-                            '[orderTimeout] Gagal kirim notif timeout',
-                            {
-                                orderId: order.id,
-                                err: e.message,
-                            }
-                        )
-                    );
+                    .catch(() => { });
 
-                logger.info(
-                    '[orderTimeout] Auto-cancelled 1 stale order',
-                    {
-                        orderId: order.id,
-                        paymentMethod: order.payment_method,
-                    }
-                );
+                // Kabari toko supaya berhenti menyiapkan pesanan
+                if (order.type === 'food' && order.merchant_id) {
+                    await notificationService
+                        .sendToUser(order.merchant_id, {
+                            title: 'Pesanan dibatalkan',
+                            body: 'Tidak ada driver yang menerima pesanan ini.',
+                            data: {
+                                order_id: order.id,
+                                type: 'order_cancelled',
+                                service: 'food',
+                            },
+                        })
+                        .catch(() => { });
+                }
+
+                logger.info('[orderTimeout] Auto-cancelled order tanpa driver', {
+                    orderId: order.id,
+                    paymentMethod: order.payment_method,
+                });
             } catch (err: any) {
                 logger.warn('[orderTimeout] Gagal cancel order stale', {
                     orderId: order.id,
@@ -136,13 +184,12 @@ export const orderTimeoutService = {
             }
         }
     },
+
     // ============================================================
-    // 2. AUTO-CANCEL PAYMENT (QRIS/VA) — belum dibayar > 15 menit
+    // 2. PAYMENT (QRIS/VA) belum dibayar > 15 menit
     // ============================================================
     async cancelStalePaymentOrders() {
-        const cutoff = new Date(
-            Date.now() - PAYMENT_TIMEOUT_MS
-        ).toISOString();
+        const cutoff = new Date(Date.now() - PAYMENT_TIMEOUT_MS).toISOString();
 
         const { data: stale, error } = await supabaseAdmin
             .from('orders')
@@ -150,18 +197,16 @@ export const orderTimeoutService = {
                 'id, customer_id, type, payment_method, payment_reference, payment_status'
             )
             .eq('status', 'pending')
-            .eq('payment_status', 'pending')                 // ⬅️ belum paid
-            .in('payment_method', ['qris', 'bank_transfer']) // ⬅️ hanya QRIS/VA
+            .eq('payment_status', 'pending')
+            .in('payment_method', ['qris', 'bank_transfer'])
             .lt('created_at', cutoff);
 
         if (error) {
-            logger.error(
-                '[orderTimeout] Gagal cari payment stale',
-                { error: error.message }
-            );
+            logger.error('[orderTimeout] Gagal cari payment stale', {
+                error: error.message,
+            });
             return;
         }
-
         if (!stale || stale.length === 0) return;
 
         logger.info('[orderTimeout] Auto-cancel payment stale', {
@@ -170,42 +215,29 @@ export const orderTimeoutService = {
 
         for (const order of stale) {
             try {
-                // Update + select (race-safe) — pastikan masih pending
-                const { data: updated, error: updateErr } =
-                    await supabaseAdmin
-                        .from('orders')
-                        .update({
-                            status: 'cancelled',
-                            cancelled_at: new Date().toISOString(),
-                            cancellation_reason:
-                                'Pembayaran tidak diselesaikan dalam 15 menit',
-                        })
-                        .eq('id', order.id)
-                        .eq('status', 'pending')
-                        .eq('payment_status', 'pending')      // ⬅️ guard
-                        .select('id')
-                        .maybeSingle();
+                const { data: updated, error: updateErr } = await supabaseAdmin
+                    .from('orders')
+                    .update({
+                        status: 'cancelled',
+                        cancelled_at: new Date().toISOString(),
+                        cancellation_reason:
+                            'Pembayaran tidak diselesaikan dalam 15 menit',
+                    })
+                    .eq('id', order.id)
+                    .eq('status', 'pending')
+                    .eq('payment_status', 'pending')
+                    .select('id')
+                    .maybeSingle();
 
                 if (updateErr) {
-                    logger.warn(
-                        '[orderTimeout] Gagal cancel payment stale',
-                        {
-                            orderId: order.id,
-                            err: updateErr.message,
-                        }
-                    );
+                    logger.warn('[orderTimeout] Gagal cancel payment stale', {
+                        orderId: order.id,
+                        err: updateErr.message,
+                    });
                     continue;
                 }
+                if (!updated) continue;
 
-                if (!updated) {
-                    logger.info(
-                        '[orderTimeout] Payment sudah paid/tidak pending, skip',
-                        { orderId: order.id }
-                    );
-                    continue;
-                }
-
-                // Update order_payments → EXPIRED
                 await supabaseAdmin
                     .from('order_payments')
                     .update({
@@ -215,7 +247,6 @@ export const orderTimeoutService = {
                     .eq('order_id', order.id)
                     .eq('status', 'PENDING');
 
-                // Cleanup bid (kalau ada)
                 await supabaseAdmin
                     .from('order_bids')
                     .update({
@@ -225,7 +256,6 @@ export const orderTimeoutService = {
                     .eq('order_id', order.id)
                     .eq('status', 'pending');
 
-                // Notif ke customer
                 await notificationService
                     .sendToUser(order.customer_id, {
                         title: 'Pesanan dibatalkan',
@@ -237,76 +267,49 @@ export const orderTimeoutService = {
                             service: order.type,
                         },
                     })
-                    .catch((e) =>
-                        logger.warn(
-                            '[orderTimeout] Gagal kirim notif payment timeout',
-                            {
-                                orderId: order.id,
-                                err: e.message,
-                            }
-                        )
-                    );
+                    .catch(() => { });
 
-                logger.info(
-                    '[orderTimeout] Auto-cancelled stale payment order',
-                    {
-                        orderId: order.id,
-                        paymentMethod: order.payment_method,
-                        paymentReference: order.payment_reference,
-                    }
-                );
+                logger.info('[orderTimeout] Auto-cancelled stale payment order', {
+                    orderId: order.id,
+                    paymentMethod: order.payment_method,
+                    paymentReference: order.payment_reference,
+                });
             } catch (err: any) {
-                logger.warn(
-                    '[orderTimeout] Gagal cancel stale payment order',
-                    {
-                        orderId: order.id,
-                        err: err.message,
-                    }
-                );
+                logger.warn('[orderTimeout] Gagal cancel stale payment order', {
+                    orderId: order.id,
+                    err: err.message,
+                });
             }
         }
     },
 
     // ============================================================
-    // START — Jalankan interval
+    // START / STOP
     // ============================================================
     start(intervalMs = 60_000) {
-        // Cegah double-start
         if (intervalRef) {
-            logger.warn(
-                'Order timeout service sudah jalan, skip start ulang'
-            );
+            logger.warn('Order timeout service sudah jalan, skip start ulang');
             return;
         }
 
-        console.log(
-            '[order-timeout] Service started, interval:',
-            intervalMs,
-            'ms'
-        );
+        console.log('[order-timeout] Service started, interval:', intervalMs, 'ms');
+
+        const run = (name: string, fn: () => Promise<void>) =>
+            fn().catch((e) =>
+                logger.error(`order-timeout cron error (${name})`, {
+                    err: e.message,
+                })
+            );
 
         intervalRef = setInterval(() => {
-            // 1. Cancel order pending tanpa driver (cash/wallet)
-            this.cancelStalePendingOrders().catch((e) =>
-                logger.error('order-timeout cron error (pending)', {
-                    err: e.message,
-                })
-            );
-
-            // 2. Cancel order QRIS/VA belum dibayar
-            this.cancelStalePaymentOrders().catch((e) =>
-                logger.error('order-timeout cron error (payment)', {
-                    err: e.message,
-                })
-            );
+            run('merchant', () => this.rejectUnansweredMerchantOrders());
+            run('pending', () => this.cancelStalePendingOrders());
+            run('payment', () => this.cancelStalePaymentOrders());
         }, intervalMs);
 
         logger.info('Order timeout service started', { intervalMs });
     },
 
-    // ============================================================
-    // STOP — Graceful shutdown
-    // ============================================================
     stop() {
         if (intervalRef) {
             clearInterval(intervalRef);

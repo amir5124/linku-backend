@@ -35,7 +35,7 @@ const CHANNEL_MAP: Record<UserRole, string> = {
 const SOUND_MAP: Record<UserRole, string> = {
     customer: 'customer.mp3',           // sebelumnya 'customer'
     driver: 'driver_order.mp3',
-    merchant: 'merchant-order',         // lihat catatan di bawah
+    merchant: 'merchant_order.mp3',         // lihat catatan di bawah
 };
 
 // Fallback kalau role tidak dikenal

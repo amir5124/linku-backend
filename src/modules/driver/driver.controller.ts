@@ -109,7 +109,7 @@ export const driverController = {
 
         return ok(res, data, 'Dokumen verifikasi dikirim');
     }),
-    
+
     getVerification: asyncHandler(async (req: Request, res: Response) => {
         const data = await driverService.getVerification(req.user!.id);
         return ok(res, data);

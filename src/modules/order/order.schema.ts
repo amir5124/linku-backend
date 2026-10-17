@@ -19,26 +19,15 @@ export const createOrderSchema = z
             distance_km: z.number(),
             duration_min: z.number().optional(),
 
-            // ═══════════════════════════════════════════════════
             // ✅ PAYMENT
-            // ═══════════════════════════════════════════════════
             payment_method: z
                 .enum(['cash', 'wallet', 'qris', 'bank_transfer'])
                 .default('cash'),
 
-            // Untuk VA transfer bank (wajib kalau bank_transfer)
             bank_code: z
-                .enum([
-                    'BRI',
-                    'BNI',
-                    'MANDIRI',
-                    'BCA',
-                    'PERMATA',
-                    'CIMB',
-                ])
+                .enum(['BRI', 'BNI', 'MANDIRI', 'BCA', 'PERMATA', 'CIMB'])
                 .optional(),
 
-            // Untuk e-wallet (opsional — kalau mau support DANA/OVO via QRIS)
             ewallet_code: z
                 .enum(['OVO', 'DANA', 'LINKAJA', 'GOPAY', 'SHOPEEPAY'])
                 .optional(),
@@ -46,7 +35,6 @@ export const createOrderSchema = z
             notes: z.string().optional(),
             merchant_id: z.string().uuid().optional(),
 
-            // Field tarif dari frontend
             tariff_code: z.string().optional(),
             option_name: z.string().optional(),
 
@@ -70,19 +58,14 @@ export const createOrderSchema = z
             sender_landmark: z.string().optional(),
             receiver_landmark: z.string().optional(),
 
-            // ⬇️ Field paket USend
             package_type: z.string().optional(),
             package_size: z.enum(['kecil', 'sedang', 'besar']).optional(),
             package_weight: z.string().optional(),
             package_protection: z.enum(['silver', 'gold']).optional(),
         }),
     })
-    // ═══════════════════════════════════════════════════════════
-    // ✅ VALIDASI KONDISIONAL — payment method vs bank_code
-    // ═══════════════════════════════════════════════════════════
     .refine(
         (data) => {
-            // bank_transfer → wajib bank_code
             if (data.body.payment_method === 'bank_transfer') {
                 return !!data.body.bank_code;
             }
@@ -93,33 +76,41 @@ export const createOrderSchema = z
             path: ['body', 'bank_code'],
         }
     )
-    // qris dengan ewallet → wajib ewallet_code (opsional, kalau dipakai)
+    // food wajib punya merchant_id dan minimal 1 item
     .refine(
-        (data) => {
-            // Kalau qris DAN user pilih ewallet, wajib ewallet_code
-            // (opsional — kalau tidak pakai ewallet, skip)
-            return true;
-        },
+        (data) =>
+            data.body.type !== 'food' ||
+            (!!data.body.merchant_id && (data.body.items?.length ?? 0) > 0),
         {
-            message: 'ewallet_code tidak valid',
-            path: ['body', 'ewallet_code'],
+            message: 'merchant_id dan items wajib untuk order makanan',
+            path: ['body', 'merchant_id'],
         }
     );
 
 // ============================================================
 // UPDATE STATUS SCHEMA
+// 'accepted' DIHAPUS: penerimaan order hanya lewat POST /:id/accept (driver)
+// dan POST /:id/merchant-accept (toko).
 // ============================================================
 export const updateStatusSchema = z.object({
     body: z.object({
-        status: z.enum([
-            'accepted',
-            'arrived',
-            'in_progress',
-            'completed',
-            'cancelled',
-        ]),
+        status: z.enum(['arrived', 'in_progress', 'completed', 'cancelled']),
         reason: z.string().optional(),
-        // ⬇️ untuk validasi complete order USend
         send_code: z.string().optional(),
+    }),
+});
+
+// ============================================================
+// RESPONS MERCHANT
+// ============================================================
+export const merchantAcceptSchema = z.object({
+    body: z.object({
+        prep_minutes: z.number().int().min(1).max(180).optional(),
+    }),
+});
+
+export const merchantRejectSchema = z.object({
+    body: z.object({
+        reason: z.string().max(200).optional(),
     }),
 });

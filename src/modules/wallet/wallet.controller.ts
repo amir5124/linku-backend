@@ -1,6 +1,7 @@
 // src/modules/wallet/wallet.controller.ts
 import { Request, Response } from 'express';
 import { walletService } from './wallet.service';
+import { merchantWalletService } from './merchant-wallet.service';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created } from '../../utils/response';
 import { ApiError } from '../../utils/ApiError';
@@ -17,10 +18,17 @@ export const walletController = {
     // GET /api/wallet
     // ============================================================
     getWallet: asyncHandler(async (req: Request, res: Response) => {
+        const userId = req.user!.id;
+
+        // Merchant punya tabel sendiri (merchant_wallets): saldo + utang komisi
+        if (req.user?.role === 'merchant') {
+            return ok(res, await merchantWalletService.getWallet(userId));
+        }
+
         const data =
             req.user?.role === 'driver'
-                ? await walletService.getWallet(req.user!.id, 'driver')
-                : await walletService.getWallet(req.user!.id, 'customer');
+                ? await walletService.getWallet(userId, 'driver')
+                : await walletService.getWallet(userId, 'customer');
         return ok(res, data);
     }),
 
@@ -30,16 +38,21 @@ export const walletController = {
     listLedger: asyncHandler(async (req: Request, res: Response) => {
         const limit = Number(req.query.limit ?? 50);
         const offset = Number(req.query.offset ?? 0);
-        const role = resolveWalletRole(req);
+        const userId = req.user!.id;
 
+        // Merchant: riwayat dari merchant_wallet_ledger
+        if (req.user?.role === 'merchant') {
+            return ok(
+                res,
+                await merchantWalletService.listLedger(userId, limit, offset)
+            );
+        }
+
+        const role = resolveWalletRole(req);
         const data =
             role === 'driver'
-                ? await walletService.listLedger(req.user!.id, limit, offset)
-                : await walletService.listLedgerCustomer(
-                    req.user!.id,
-                    limit,
-                    offset
-                );
+                ? await walletService.listLedger(userId, limit, offset)
+                : await walletService.listLedgerCustomer(userId, limit, offset);
 
         return ok(res, data);
     }),
@@ -192,7 +205,7 @@ export const walletController = {
     }),
 
     // ============================================================
-    // ✅ HISTORY TOPUP
+    // HISTORY TOPUP
     // GET /api/wallet/topups?limit=20&offset=0&status=SUCCESS
     // ============================================================
     listTopups: asyncHandler(async (req: Request, res: Response) => {
@@ -210,7 +223,7 @@ export const walletController = {
     }),
 
     // ============================================================
-    // ✅ HISTORY WITHDRAWAL
+    // HISTORY WITHDRAWAL
     // GET /api/wallet/withdrawals?limit=20&offset=0&status=SUCCESS
     // ============================================================
     listWithdrawals: asyncHandler(async (req: Request, res: Response) => {
@@ -228,7 +241,7 @@ export const walletController = {
     }),
 
     // ============================================================
-    // ✅ HISTORY TRANSACTIONS (gabungan)
+    // HISTORY TRANSACTIONS (gabungan)
     // GET /api/wallet/transactions?limit=20&offset=0
     // ============================================================
     listTransactions: asyncHandler(async (req: Request, res: Response) => {

@@ -24,11 +24,14 @@ router.use(requireAuth);
 // ============================================================
 // ROOMS
 // ============================================================
-// 🆕 List semua room milik user (untuk tab Pesan)
+// List semua room milik user (untuk tab Pesan)
 router.get('/rooms', chatController.listRooms);
 
 // Buka / buat room untuk order tertentu
 router.post('/rooms/order/:orderId', chatController.openRoom);
+
+// 🆕 Status room (chat_open, chat_closes_at)
+router.get('/rooms/:roomId/status', chatController.roomStatus);
 
 // ============================================================
 // MESSAGES

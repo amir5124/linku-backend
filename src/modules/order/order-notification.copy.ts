@@ -204,7 +204,7 @@ export function statusNotif(p: StatusParams): Copy {
         if (toCustomer && senderIsDriver) {
             return {
                 title: 'Sudah sampai tujuan ✨',
-                body: `Terima kasih sudah pakai LinkU. Jangan lupa beri rating untuk ${who} ya!`,
+                body: `Terima kasih sudah pakai Waruung. Jangan lupa beri rating untuk ${who} ya!`,
             };
         }
         if (toDriver) return { title: 'Perjalanan selesai 🎯', body: 'Order selesai. Kamu kembali online sekarang.' };

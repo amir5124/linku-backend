@@ -3,15 +3,21 @@ import { supabaseAdmin } from '../../config/supabase';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';
+import { assertOrderChatOpen, chatWindow, CHAT_CLOSED_MSG } from './chat-window';
 
 export const chatService = {
     // ============================================================
     // GET / CREATE ROOM
+    // - Room yang sudah ada selalu bisa dibuka (untuk membaca riwayat).
+    // - Room BARU tidak dibuat kalau chat order itu sudah ditutup.
+    // - Respons menyertakan chat_open & chat_closes_at.
     // ============================================================
     async getOrCreateRoom(orderId: number, userId: string) {
         const { data: order } = await supabaseAdmin
             .from('orders')
-            .select('id, customer_id, driver_id, merchant_id')
+            .select(
+                'id, customer_id, driver_id, merchant_id, status, completed_at, cancelled_at, updated_at'
+            )
             .eq('id', orderId)
             .single();
 
@@ -25,13 +31,18 @@ export const chatService = {
         if (!isParticipant) throw ApiError.forbidden('Bukan peserta order ini');
         if (!order.driver_id) throw ApiError.badRequest('Order belum punya driver');
 
+        const win = chatWindow(order);
+
         const { data: existing } = await supabaseAdmin
             .from('chat_rooms')
             .select('*')
             .eq('order_id', orderId)
             .maybeSingle();
 
-        if (existing) return existing;
+        if (existing) return { ...existing, ...win };
+
+        // Room baru: tidak ada gunanya kalau chat sudah ditutup
+        if (!win.chat_open) throw ApiError.forbidden(CHAT_CLOSED_MSG);
 
         const { data, error } = await supabaseAdmin
             .from('chat_rooms')
@@ -45,7 +56,38 @@ export const chatService = {
             .single();
 
         if (error) throw ApiError.internal(error.message);
-        return data;
+        return { ...data, ...win };
+    },
+
+    // ============================================================
+    // 🆕 STATUS ROOM — dipakai layar chat untuk tahu kapan chat ditutup
+    // ============================================================
+    async roomStatus(roomId: number, userId: string) {
+        const { data: room } = await supabaseAdmin
+            .from('chat_rooms')
+            .select('id, order_id, customer_id, driver_id, merchant_id')
+            .eq('id', roomId)
+            .single();
+
+        if (!room) throw ApiError.notFound('Room tidak ditemukan');
+
+        const isParticipant =
+            room.customer_id === userId ||
+            room.driver_id === userId ||
+            room.merchant_id === userId;
+        if (!isParticipant) throw ApiError.forbidden();
+
+        const { data: order } = await supabaseAdmin
+            .from('orders')
+            .select('status, completed_at, cancelled_at, updated_at')
+            .eq('id', room.order_id)
+            .maybeSingle();
+
+        const win = order
+            ? chatWindow(order)
+            : { chat_open: false, chat_closes_at: null };
+
+        return { room_id: room.id, order_id: room.order_id, ...win };
     },
 
     // ============================================================
@@ -78,6 +120,7 @@ export const chatService = {
         if (!rooms || rooms.length === 0) return [];
 
         const roomIds = rooms.map((r) => r.id);
+        const orderIds = Array.from(new Set(rooms.map((r) => r.order_id)));
 
         // 2. Ambil pesan terakhir untuk setiap room
         const { data: lastMessages } = await supabaseAdmin
@@ -129,7 +172,16 @@ export const chatService = {
 
         const profileMap = new Map(profiles.map((p) => [p.id, p]));
 
-        // 5. Gabungkan
+        // 5. 🆕 Jendela chat per order
+        const { data: orderRows } = await supabaseAdmin
+            .from('orders')
+            .select('id, status, completed_at, cancelled_at, updated_at')
+            .in('id', orderIds);
+        const orderMap = new Map<number, any>(
+            (orderRows ?? []).map((o: any) => [o.id, o])
+        );
+
+        // 6. Gabungkan
         return rooms.map((r) => {
             // Tentukan peer (siapa yang bukan userId)
             let peerId = '';
@@ -141,6 +193,10 @@ export const chatService = {
 
             const peer = profileMap.get(peerId);
             const lastMsg = lastMsgMap.get(r.id);
+            const order = orderMap.get(r.order_id);
+            const win = order
+                ? chatWindow(order)
+                : { chat_open: false, chat_closes_at: null };
 
             return {
                 id: r.id,
@@ -155,12 +211,13 @@ export const chatService = {
                     r.last_message_at ?? lastMsg?.created_at ?? null,
                 created_at: r.created_at,
                 unread_count: unreadMap.get(r.id) ?? 0,
+                ...win,
             };
         });
     },
 
     // ============================================================
-    // LIST MESSAGES
+    // LIST MESSAGES — tetap bisa dibaca walau chat sudah ditutup
     // ============================================================
     async listMessages(roomId: number, userId: string, limit = 100) {
         const { data: room } = await supabaseAdmin
@@ -212,6 +269,9 @@ export const chatService = {
             room.merchant_id === senderId;
 
         if (!isParticipant) throw ApiError.forbidden();
+
+        // ✅ Chat ditutup 30 menit setelah order selesai
+        await assertOrderChatOpen(room.order_id);
 
         const { data, error } = await supabaseAdmin
             .from('chat_messages')
@@ -277,6 +337,9 @@ export const chatService = {
             room.merchant_id === senderId;
 
         if (!isParticipant) throw ApiError.forbidden('Bukan peserta chat');
+
+        // ✅ Cek SEBELUM upload ke storage, supaya tidak ada file yatim
+        await assertOrderChatOpen(room.order_id);
 
         const ext = file.originalname.split('.').pop() || 'jpg';
         const filename = `${roomId}/${senderId}-${Date.now()}.${ext}`;
