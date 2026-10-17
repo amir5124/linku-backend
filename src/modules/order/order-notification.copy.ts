@@ -2,11 +2,17 @@
 // Teks notifikasi order yang disesuaikan dengan layanan: ride, send (kirim paket), food (pesan makanan).
 // Semua fungsi murni (tanpa akses database), hanya menghasilkan { title, body }.
 
-export type OrderKind = 'ride' | 'send' | 'food';
+export type OrderKind = 'ride' | 'send' | 'food' | 'jastip';
 
-/** order.type → jenis layanan. Selain 'food' dan 'send' dianggap ride. */
+/** order.type → jenis layanan. Selain food/send/jastip dianggap ride. */
 export const kindOf = (type?: string | null): OrderKind =>
-    type === 'food' ? 'food' : type === 'send' ? 'send' : 'ride';
+    type === 'food'
+        ? 'food'
+        : type === 'send'
+            ? 'send'
+            : type === 'jastip'
+                ? 'jastip'
+                : 'ride';
 
 export type Copy = { title: string; body: string };
 
@@ -34,6 +40,14 @@ export function newOrderForDriver(p: {
         return {
             title: p.autobid ? '📦 Kamu dapat antar paket (Autobid)' : 'Antar paket baru 📦',
             body: `Ambil di ${p.pickup} → ${p.dropoff} · ${tail}`,
+        };
+    }
+
+    if (p.kind === 'jastip') {
+        const items = p.itemCount && p.itemCount > 0 ? ` (${p.itemCount} barang)` : '';
+        return {
+            title: p.autobid ? '🛍️ Kamu dapat jastip (Autobid)' : 'Jastip baru 🛍️',
+            body: `Belanja di ${p.pickup}${items} → ${p.dropoff} · ${tail}`,
         };
     }
 
@@ -73,6 +87,13 @@ export function driverFoundForCustomer(p: {
         };
     }
 
+    if (p.kind === 'jastip') {
+        return {
+            title: 'Driver jastip sudah dapat! 🛍️',
+            body: `${who} akan membelikan titipanmu di ${p.pickup ?? 'toko'}`,
+        };
+    }
+
     if (p.kind === 'food') {
         return {
             title: 'Drivermu sudah dapat! 🍜',
@@ -94,6 +115,12 @@ export function searchingForCustomer(kind: OrderKind): Copy {
         return {
             title: 'Mencari driver…',
             body: 'Kami sedang mencarikan driver untuk mengantar paketmu. Mohon tunggu.',
+        };
+    }
+    if (kind === 'jastip') {
+        return {
+            title: 'Mencari driver…',
+            body: 'Kami sedang mencarikan driver untuk membelikan titipanmu. Mohon tunggu.',
         };
     }
     if (kind === 'food') {
@@ -133,8 +160,24 @@ export function statusNotif(p: StatusParams): Copy {
     const toDriver = target === 'driver';
     const toMerchant = target === 'merchant';
 
+    // ---------------- purchasing (khusus jastip) ----------------
+    if (status === 'purchasing') {
+        if (toCustomer) {
+            return { title: 'Driver mulai berbelanja 🛒', body: `${who} sedang membelikan titipanmu di ${pickup}` };
+        }
+        if (toDriver) return { title: 'Mulai belanja', body: 'Beli semua barang lalu unggah foto struk' };
+        return { title: 'Driver sedang berbelanja', body: `${who} sedang berbelanja` };
+    }
+
     // ---------------- arrived ----------------
     if (status === 'arrived') {
+        if (kind === 'jastip') {
+            if (toCustomer && senderIsDriver) {
+                return { title: 'Driver sudah di toko 📍', body: `${who} sudah tiba di ${pickup} dan siap berbelanja` };
+            }
+            if (toDriver) return { title: 'Kamu sudah di toko', body: `Mulai belanja titipan di ${pickup}` };
+            return { title: 'Driver sudah tiba', body: `${who} sudah di ${pickup}` };
+        }
         if (kind === 'food') {
             if (toCustomer && senderIsDriver) {
                 return { title: 'Driver sudah di resto 🍽️', body: `${who} sudah tiba di ${pickup} dan mengambil pesananmu` };
@@ -160,6 +203,13 @@ export function statusNotif(p: StatusParams): Copy {
 
     // ---------------- in_progress ----------------
     if (status === 'in_progress') {
+        if (kind === 'jastip') {
+            if (toCustomer && senderIsDriver) {
+                return { title: 'Belanjaanmu sedang diantar 🛵', body: `${who} menuju ${dropoff}. Siap-siap menerima ya!` };
+            }
+            if (toDriver) return { title: 'Antar belanjaan', body: `Antar belanjaan ke ${dropoff}` };
+            return { title: 'Belanjaan dalam perjalanan', body: `Menuju ${dropoff}` };
+        }
         if (kind === 'food') {
             if (toCustomer && senderIsDriver) {
                 return { title: 'Pesananmu sedang diantar 🛵', body: `${who} menuju ${dropoff}. Siap-siap menerima ya!` };
@@ -185,6 +235,13 @@ export function statusNotif(p: StatusParams): Copy {
 
     // ---------------- completed ----------------
     if (status === 'completed') {
+        if (kind === 'jastip') {
+            if (toCustomer && senderIsDriver) {
+                return { title: 'Belanjaan tiba! 🛍️', body: `Titipanmu sudah sampai. Jangan lupa beri rating untuk ${who} ya!` };
+            }
+            if (toDriver) return { title: 'Jastip selesai 🎯', body: 'Belanjaan terantar. Kamu kembali online sekarang.' };
+            return { title: 'Jastip selesai', body: `Sampai di ${dropoff}` };
+        }
         if (kind === 'food') {
             if (toCustomer && senderIsDriver) {
                 return { title: 'Pesanan tiba! 🍽️', body: `Selamat menikmati makananmu. Jangan lupa beri rating untuk ${who} ya!` };
@@ -204,7 +261,7 @@ export function statusNotif(p: StatusParams): Copy {
         if (toCustomer && senderIsDriver) {
             return {
                 title: 'Sudah sampai tujuan ✨',
-                body: `Terima kasih sudah pakai Waruung. Jangan lupa beri rating untuk ${who} ya!`,
+                body: `Terima kasih sudah pakai LinkU. Jangan lupa beri rating untuk ${who} ya!`,
             };
         }
         if (toDriver) return { title: 'Perjalanan selesai 🎯', body: 'Order selesai. Kamu kembali online sekarang.' };
@@ -213,7 +270,8 @@ export function statusNotif(p: StatusParams): Copy {
 
     // ---------------- cancelled ----------------
     if (status === 'cancelled') {
-        const noun = kind === 'send' ? 'Pengiriman' : kind === 'food' ? 'Pesanan' : 'Perjalanan';
+        const noun =
+            kind === 'send' ? 'Pengiriman' : kind === 'food' || kind === 'jastip' ? 'Pesanan' : 'Perjalanan';
         if (toCustomer) {
             return {
                 title: `${noun} dibatalkan`,

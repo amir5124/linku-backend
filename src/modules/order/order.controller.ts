@@ -107,4 +107,30 @@ export const orderController = {
 
         return ok(res, data, 'Foto paket berhasil diunggah');
     }),
+
+    confirmPurchase: asyncHandler(async (req: Request, res: Response) => {
+        if (!req.file) {
+            throw ApiError.badRequest('Foto struk wajib diunggah');
+        }
+
+        let items: unknown;
+        try {
+            items = JSON.parse(String(req.body.items ?? '[]'));
+        } catch {
+            throw ApiError.badRequest('Format items tidak valid');
+        }
+
+        if (!Array.isArray(items) || items.length === 0) {
+            throw ApiError.badRequest('Items pembelian wajib diisi');
+        }
+
+        const data = await orderService.confirmPurchase(
+            Number(req.params.id),
+            req.user!.id,
+            { items },
+            req.file
+        );
+
+        return ok(res, data, 'Pembelian berhasil dikonfirmasi');
+    }),
 };

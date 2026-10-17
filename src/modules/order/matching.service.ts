@@ -21,15 +21,22 @@ const MATCH_LIMIT = 20;
  * Ride/send punya varian S dan L, jadi tidak ditebak.
  *
  * Sesuaikan lewat env FOOD_TARIFF_CODE kalau kodenya berbeda
- * (contoh data sekarang: 'warfood'; di LinkU mungkin 'ufood').
+ * (LinkU: 'ufood').
  */
 const DEFAULT_TARIFF_BY_TYPE: Record<string, string | undefined> = {
-    food: process.env.FOOD_TARIFF_CODE ?? 'warfood',
+    food: process.env.FOOD_TARIFF_CODE ?? 'ufood',
 };
 
 // ============================================================
 // TYPE — hasil dari RPC find_nearby_drivers
 // ============================================================
+/**
+ * Jastip memakai kumpulan driver MOTOR yang sama dengan URide.
+ * Filter layanan di find_nearby_drivers memakai kode tarif ini (bukan 'jastip'),
+ * supaya order jastip sampai ke driver motor. Ubah lewat env JASTIP_MATCH_TARIFF.
+ */
+const JASTIP_MATCH_TARIFF = process.env.JASTIP_MATCH_TARIFF ?? 'uride_s';
+
 export type NearbyDriverResult = {
     user_id: string;
     distance_m: number;
@@ -57,7 +64,10 @@ export const matchingService = {
         type: string,
         tariffCode?: string | null
     ): Promise<NearbyDriverResult[]> {
-        const effectiveCode = tariffCode ?? DEFAULT_TARIFF_BY_TYPE[type] ?? null;
+        const effectiveCode =
+            type === 'jastip'
+                ? JASTIP_MATCH_TARIFF
+                : tariffCode ?? DEFAULT_TARIFF_BY_TYPE[type] ?? null;
 
         console.log('[matching] === CARI DRIVER ===');
         console.log('[matching] orderId:', orderId, '| pickup:', { lat, lng });

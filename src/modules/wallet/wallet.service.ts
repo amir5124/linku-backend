@@ -19,6 +19,14 @@ const LINKQU_CONFIG = {
 };
 
 // ============================================================
+// LinkU — callback pembayaran & email default (bisa dioverride via env)
+// ============================================================
+const LINKQU_CALLBACK_URL =
+    process.env.LINKQU_CALLBACK_URL ?? 'https://linku.siappgo.id/api/wallet/callback';
+const DEFAULT_CUSTOMER_EMAIL =
+    process.env.DEFAULT_CUSTOMER_EMAIL ?? 'noreply@siappgo.id';
+
+// ============================================================
 // KONSTANTA FEE ADMIN
 // ============================================================
 const FEE_ADMIN_VA = 2500;
@@ -74,6 +82,7 @@ type OrderRow = {
     subtotal: number | null;          // ✅ FOOD
     packaging_fee: number | null;     // ✅ FOOD
     merchant_earning: number | null;  // ✅ FOOD
+    actual_item_total: number | null; // ✅ JASTIP
 };
 
 type WalletRow = {
@@ -185,7 +194,7 @@ class WalletService {
             .select(`
             id, type, status, driver_id, customer_id,
             delivery_fee, driver_earning, total_fare,
-            subtotal, packaging_fee, merchant_earning,
+            subtotal, packaging_fee, merchant_earning, actual_item_total,
             tariff_code, payment_method, payment_status,
             settled_at, commission_amount, commission_rate,
             platform_earning, settlement_type
@@ -219,14 +228,15 @@ class WalletService {
         //    ride / send: tetap total_fare.
         // ────────────────────────────────────────────────────────
         const isFood = order.type === 'food';
+        const isJastip = order.type === 'jastip';
 
         const commissionRate = await this.getCommissionRate(
             order.type,
             order.tariff_code
         );
 
-        const commissionBase = isFood
-            ? Number(order.delivery_fee) || 0                    // ✅ FOOD
+        const commissionBase = isFood || isJastip
+            ? Number(order.delivery_fee) || 0                    // ✅ FOOD / JASTIP (hanya ongkir)
             : Number(order.total_fare) || 0;
         const commissionAmount = Math.round(commissionBase * commissionRate);
         const driverEarning = commissionBase - commissionAmount;
@@ -421,6 +431,36 @@ class WalletService {
         }
 
         // ────────────────────────────────────────────────────────
+        // 5b. ✅ JASTIP: ganti uang talangan belanja driver.
+        //     Bukan pendapatan → tanpa komisi, tidak ikut total_earning,
+        //     dan tidak dipakai melunasi utang cash (itu uang driver sendiri).
+        //     Jastip selalu prabayar (non-cash).
+        // ────────────────────────────────────────────────────────
+        let jastipReimbursement = 0;
+        if (isJastip && !isCash) {
+            jastipReimbursement = Math.round(Number(order.actual_item_total) || 0);
+            if (jastipReimbursement > 0) {
+                newBalance += jastipReimbursement;
+                ledgerEntries.push({
+                    driver_id: order.driver_id,
+                    order_id: order.id,
+                    entry_type: 'jastip_reimbursement',
+                    amount: jastipReimbursement,
+                    direction: 'in',
+                    balance_after: newBalance,
+                    cash_debt_after: newCashDebt,
+                    description: `Ganti uang belanja jastip order #${order.id}`,
+                    metadata: {
+                        order_type: 'jastip',
+                        actual_item_total: jastipReimbursement,
+                    },
+                });
+            }
+        }
+        // Jastip tunai: driver sudah menerima uang belanja langsung dari customer,
+        // jadi tidak ada penggantian lewat wallet. Komisi (dari ongkir) mengikuti jalur cash.
+
+        // ────────────────────────────────────────────────────────
         // 6. Update wallet
         // ────────────────────────────────────────────────────────
         const { error: walletErr } = await supabaseAdmin
@@ -490,6 +530,7 @@ class WalletService {
             driver_earning: driverEarning,
             new_balance: newBalance,
             new_cash_debt: newCashDebt,
+            jastip_reimbursement: jastipReimbursement,
         };
     }
     // ============================================================
@@ -512,7 +553,7 @@ class WalletService {
             });
             // Fallback: sesuaikan dengan function DB
             if (orderType === 'food') return 0.15;
-            if (orderType === 'send') return 0.10;
+            if (orderType === 'send' || orderType === 'jastip') return 0.10;
             return 0.08;                    // ⬅️ FIX: ride default 8%
         }
 
@@ -659,7 +700,7 @@ class WalletService {
             .single();
 
         const customerName = profile?.full_name ?? 'Customer';
-        const customerEmail = profile?.email ?? 'noreply@warung.id';
+        const customerEmail = profile?.email ?? DEFAULT_CUSTOMER_EMAIL;
 
         const partnerReff = `TOPUP-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
         const expired = this.generateExpiredTimestamp();
@@ -684,7 +725,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: LINKQU_CALLBACK_URL,
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -710,7 +751,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: LINKQU_CALLBACK_URL,
                 customer_id: userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1103,7 +1144,7 @@ class WalletService {
             inquiry_reff: inquiryReff,
             signature,
             remark: 'Withdraw Mitra',
-            url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+            url_callback: LINKQU_CALLBACK_URL,
         };
 
         try {
@@ -1465,7 +1506,7 @@ class WalletService {
             .single();
 
         const customerName = profile?.full_name ?? 'Customer';
-        const customerEmail = profile?.email ?? 'noreply@warung.id';
+        const customerEmail = profile?.email ?? DEFAULT_CUSTOMER_EMAIL;
 
         const partnerReff = `ORDER-${input.orderId}-${Date.now()}`;
         const expired = this.generateExpiredTimestamp(15);
@@ -1490,7 +1531,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: LINKQU_CALLBACK_URL,
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,
@@ -1517,7 +1558,7 @@ class WalletService {
                 partner_reff: partnerReff,
                 expired,
                 signature,
-                url_callback: 'https://warung.siappgo.id/api/wallet/callback',
+                url_callback: LINKQU_CALLBACK_URL,
                 customer_id: input.userId,
                 customer_name: customerName,
                 customer_email: customerEmail,

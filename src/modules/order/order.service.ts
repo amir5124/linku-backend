@@ -27,11 +27,39 @@ const generateOrderCode = () =>
 const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
     pending: ['accepted', 'cancelled'],
     accepted: ['arrived', 'cancelled'],
-    arrived: ['in_progress', 'cancelled'],
+    arrived: ['in_progress', 'purchasing', 'cancelled'], // 'purchasing' khusus jastip
+    purchasing: ['in_progress', 'cancelled'], // keluar normal lewat confirmPurchase()
     in_progress: ['completed', 'cancelled'],
     completed: [],
     cancelled: [],
 };
+
+// ── Jastip ──
+const JASTIP_DEFAULT_TARIFF = 'ujastip';
+const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
+const MAX_JASTIP_ITEMS = 30;
+
+// Jastip TUNAI (customer bayar ke driver saat antar). Semua bisa diubah di tabel
+// `settings` tanpa deploy ulang:
+//   jastip_cash_max_budget  → batas belanja tunai (default 100000)
+//   jastip_cash_min_orders  → minimal order selesai customer (default 3; 0 = semua boleh)
+//   jastip_prepaid_max_budget → batas belanja prabayar (default 500000)
+const JASTIP_CASH_MAX_BUDGET = 100_000;
+const JASTIP_CASH_MIN_ORDERS = 3;
+
+async function getNumberSetting(key: string, fallback: number): Promise<number> {
+    try {
+        const { data } = await supabaseAdmin
+            .from('settings')
+            .select('value')
+            .eq('key', key)
+            .maybeSingle();
+        const n = Number(data?.value);
+        return data?.value != null && Number.isFinite(n) && n >= 0 ? n : fallback;
+    } catch {
+        return fallback;
+    }
+}
 
 function parseEwkbHex(hex: string): Coords | null {
     if (!hex || typeof hex !== 'string') return null;
@@ -176,11 +204,12 @@ async function assertMerchantOpen(
 }
 
 type OrderItemInput = {
-    menu_item_id: number;
+    menu_item_id: number | null;
     name: string;
     variant: string | null;
     qty: number;
     price: number;
+    est_price?: number | null;
 };
 
 // ============================================================
@@ -224,6 +253,10 @@ export const orderService = {
                     usedKm: distanceKm,
                 }
             );
+        }
+
+        if (input.type === 'jastip' && !input.tariff_code) {
+            input.tariff_code = JASTIP_DEFAULT_TARIFF;
         }
 
         let delivery_fee = 0;
@@ -371,6 +404,60 @@ export const orderService = {
 
             subtotal = validatedItems.reduce((s, i) => s + i.qty * i.price, 0);
             packaging_fee = 0;
+        } else if (input.type === 'jastip') {
+            if (!Array.isArray(input.items) || input.items.length === 0) {
+                throw ApiError.badRequest('Daftar belanja wajib diisi');
+            }
+            if (input.items.length > MAX_JASTIP_ITEMS) {
+                throw ApiError.badRequest(`Maksimal ${MAX_JASTIP_ITEMS} item`);
+            }
+
+            validatedItems = input.items.map((i: any): OrderItemInput => {
+                const name = String(i.name ?? '').trim();
+                const qty = Math.floor(Number(i.qty));
+                const est = Number(i.est_price ?? i.price);
+
+                if (!name || name.length > 120) {
+                    throw ApiError.badRequest('Nama barang tidak valid');
+                }
+                if (!(qty > 0 && qty <= 99)) {
+                    throw ApiError.badRequest(`Jumlah "${name}" tidak valid`);
+                }
+                if (!Number.isFinite(est) || est < 0) {
+                    throw ApiError.badRequest(`Perkiraan harga "${name}" tidak valid`);
+                }
+
+                return {
+                    menu_item_id: null,
+                    name,
+                    variant: i.variant ? String(i.variant).slice(0, 200) : null,
+                    qty,
+                    price: est,
+                    est_price: est,
+                };
+            });
+
+            const estimated = validatedItems.reduce((s, i) => s + i.qty * i.price, 0);
+            const requested = Number(input.item_budget);
+            // budget = pagu belanja yang dibayar di muka; minimal sama dengan estimasi
+            subtotal =
+                Number.isFinite(requested) && requested >= estimated
+                    ? Math.round(requested)
+                    : Math.round(estimated);
+
+            if (!(subtotal > 0)) {
+                throw ApiError.badRequest('Budget belanja tidak valid');
+            }
+            const isCashJastip = (input.payment_method ?? 'cash') === 'cash';
+            const maxBudget = isCashJastip
+                ? await getNumberSetting('jastip_cash_max_budget', JASTIP_CASH_MAX_BUDGET)
+                : await getNumberSetting('jastip_prepaid_max_budget', MAX_JASTIP_BUDGET);
+            if (subtotal > maxBudget) {
+                throw ApiError.badRequest(
+                    `Budget belanja ${isCashJastip ? 'tunai ' : ''}maksimal ${rp(maxBudget)}`
+                );
+            }
+            packaging_fee = 0;
         } else if (input.items?.length) {
             validatedItems = input.items.map((i: any): OrderItemInput => ({
                 menu_item_id: i.menu_item_id,
@@ -386,6 +473,29 @@ export const orderService = {
         const total_fare = subtotal + delivery_fee + packaging_fee;
 
         const paymentMethod = input.payment_method ?? 'cash';
+
+        // Jastip tunai: hanya untuk customer yang sudah punya riwayat order selesai
+        // (driver menalangi uang belanja, jadi risiko customer baru ditekan).
+        if (input.type === 'jastip' && paymentMethod === 'cash') {
+            const minOrders = await getNumberSetting(
+                'jastip_cash_min_orders',
+                JASTIP_CASH_MIN_ORDERS
+            );
+            if (minOrders > 0) {
+                const { count: doneCount } = await supabaseAdmin
+                    .from('orders')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('customer_id', customerId)
+                    .eq('status', 'completed');
+
+                if ((doneCount ?? 0) < minOrders) {
+                    throw ApiError.badRequest(
+                        `Jastip tunai tersedia setelah ${minOrders} order selesai ` +
+                        `(kamu baru ${doneCount ?? 0}). Gunakan pembayaran wallet / QRIS / transfer bank.`
+                    );
+                }
+            }
+        }
 
         if (paymentMethod === 'bank_transfer' && !input.bank_code) {
             throw ApiError.badRequest(
@@ -485,7 +595,7 @@ export const orderService = {
                 admin_fee,
                 total_fare,
                 driver_earning,
-                merchant_earning: subtotal,
+                merchant_earning: input.type === 'jastip' ? 0 : subtotal,
                 platform_earning,
                 payment_method: paymentMethod,
                 payment_status: 'pending',
@@ -508,6 +618,10 @@ export const orderService = {
                 package_size: input.package_size ?? null,
                 package_weight: input.package_weight ?? null,
                 package_protection: input.package_protection ?? 'silver',
+
+                item_budget: input.type === 'jastip' ? subtotal : 0,
+                jastip_shop_note:
+                    input.type === 'jastip' ? input.shop_note ?? null : null,
             })
             .select()
             .single();
@@ -540,6 +654,7 @@ export const orderService = {
                         variant: i.variant,
                         qty: i.qty,
                         price: i.price,
+                        est_price: i.est_price ?? null,
                         subtotal: i.qty * i.price,
                     }))
                 );
@@ -1035,7 +1150,9 @@ export const orderService = {
         let autobidDriver: string | null = null;
         try {
             const { autobidService } = await import('./autobid.service');
-            autobidDriver = await autobidService.tryAutoBid(
+            // Jastip tidak boleh autobid: driver menalangi uang belanja, jadi harus
+            // menerima manual setelah melihat daftar belanja.
+            autobidDriver = order.type === 'jastip' ? null : await autobidService.tryAutoBid(
                 order.id,
                 {
                     type: order.type,
@@ -1057,11 +1174,38 @@ export const orderService = {
             .eq('id', order.customer_id)
             .maybeSingle();
 
+        // Deadline terima dihitung ulang tepat saat broadcast, supaya driver
+        // dapat waktu penuh (pembayaran QRIS / konfirmasi toko bisa lama).
+        {
+            const { data: durSetting } = await supabaseAdmin
+                .from('settings')
+                .select('value')
+                .eq('key', 'order_accept_duration_sec')
+                .maybeSingle();
+            const durSec = Number(durSetting?.value ?? 30);
+            const freshExpiresAt = new Date(Date.now() + durSec * 1000).toISOString();
+
+            const { error: expErr } = await supabaseAdmin
+                .from('orders')
+                .update({ accept_expires_at: freshExpiresAt })
+                .eq('id', order.id)
+                .eq('status', 'pending');
+
+            if (expErr) {
+                logger.warn('[order.dispatch] Gagal refresh accept_expires_at', {
+                    orderId,
+                    error: expErr.message,
+                });
+            } else {
+                order.accept_expires_at = freshExpiresAt;
+            }
+        }
+
         let itemsForNotif: any[] = [];
-        if (order.type === 'food') {
+        if (order.type === 'food' || order.type === 'jastip') {
             const { data: orderItems } = await supabaseAdmin
                 .from('order_items')
-                .select('menu_item_id, name, variant, qty, price')
+                .select('menu_item_id, name, variant, qty, price, est_price')
                 .eq('order_id', order.id);
             itemsForNotif = orderItems ?? [];
         }
@@ -1108,6 +1252,8 @@ export const orderService = {
             package_size: order.package_size ?? '',
             package_weight: order.package_weight ?? '',
             accept_expires_at: order.accept_expires_at ?? null,
+            item_budget: String(order.item_budget ?? 0),
+            jastip_shop_note: order.jastip_shop_note ?? '',
         };
 
         const driverCopyBase = {
@@ -1499,6 +1645,29 @@ export const orderService = {
             );
         }
 
+        if (status === 'purchasing' && order.type !== 'jastip') {
+            throw ApiError.badRequest('Status ini hanya untuk jastip');
+        }
+        if (status === 'purchasing' && !isDriver && role !== 'admin') {
+            throw ApiError.forbidden('Hanya driver yang bisa mulai belanja');
+        }
+        if (order.type === 'jastip' && role !== 'admin') {
+            // jastip wajib lewat tahap belanja + struk
+            if (order.status === 'arrived' && status === 'in_progress') {
+                throw ApiError.badRequest('Mulai belanja dulu, lalu unggah struk');
+            }
+            // keluar dari 'purchasing' hanya lewat confirmPurchase()
+            if (order.status === 'purchasing' && status === 'in_progress') {
+                throw ApiError.badRequest('Unggah struk untuk melanjutkan');
+            }
+            // setelah barang dalam proses dibeli, tidak bisa batal sepihak
+            if (order.status === 'purchasing' && status === 'cancelled') {
+                throw ApiError.badRequest(
+                    'Barang sudah dalam proses dibeli, hubungi admin untuk pembatalan'
+                );
+            }
+        }
+
         if (
             status === 'cancelled' &&
             isDriver &&
@@ -1691,6 +1860,222 @@ export const orderService = {
 
         return data;
     },
+
+    // ============================================================
+    // JASTIP — driver konfirmasi belanja (struk + harga riil)
+    // Model A: customer sudah bayar `item_budget` + ongkir di muka.
+    // ============================================================
+    async confirmPurchase(
+        orderId: number,
+        driverId: string,
+        input: {
+            items: {
+                id: number;
+                actual_price: number;
+                is_found: boolean;
+                substitute_note?: string;
+            }[];
+        },
+        receipt: { originalname: string; mimetype: string; buffer: Buffer }
+    ) {
+        logger.info('[order.confirmPurchase] Mulai', { orderId, driverId });
+
+        const { data: order } = await supabaseAdmin
+            .from('orders')
+            .select('*')
+            .eq('id', orderId)
+            .single();
+
+        if (!order) throw ApiError.notFound('Order tidak ditemukan');
+        if (order.driver_id !== driverId) throw ApiError.forbidden('Bukan order kamu');
+        if (order.type !== 'jastip') throw ApiError.badRequest('Hanya untuk order jastip');
+        if (order.status !== 'purchasing') {
+            throw ApiError.conflict('Order belum dalam tahap belanja');
+        }
+        const isCashOrder = order.payment_method === 'cash';
+        if (!isCashOrder && order.payment_status !== 'paid') {
+            throw ApiError.conflict('Pembayaran customer belum lunas');
+        }
+        if (!receipt?.buffer?.length) {
+            throw ApiError.badRequest('Foto struk wajib diunggah');
+        }
+
+        const { data: dbItems } = await supabaseAdmin
+            .from('order_items')
+            .select('id, name, qty')
+            .eq('order_id', orderId);
+
+        const byId = new Map<number, any>(
+            (dbItems ?? []).map((i: any) => [Number(i.id), i])
+        );
+
+        if (!Array.isArray(input.items) || input.items.length !== byId.size) {
+            throw ApiError.badRequest('Semua item harus diisi (ada atau tidak ada)');
+        }
+
+        const seen = new Set<number>();
+        let actualTotal = 0;
+        const updates = input.items.map((i) => {
+            const id = Number(i.id);
+            const row = byId.get(id);
+            if (!row || seen.has(id)) throw ApiError.badRequest('Item tidak dikenali');
+            seen.add(id);
+
+            const found = i.is_found !== false;
+            const unit = found ? Number(i.actual_price) : 0;
+            if (!Number.isFinite(unit) || unit < 0) {
+                throw ApiError.badRequest(`Harga "${row.name}" tidak valid`);
+            }
+            if (found && !(unit > 0)) {
+                throw ApiError.badRequest(`Harga "${row.name}" wajib diisi`);
+            }
+            actualTotal += unit * Number(row.qty);
+
+            return {
+                id,
+                actual_price: unit,
+                is_found: found,
+                substitute_note: i.substitute_note
+                    ? String(i.substitute_note).slice(0, 200)
+                    : null,
+            };
+        });
+
+        actualTotal = Math.round(actualTotal);
+        const budget = Number(order.item_budget ?? 0);
+
+        if (actualTotal > budget) {
+            throw ApiError.badRequest(
+                `Total belanja ${rp(actualTotal)} melebihi budget ${rp(budget)}. ` +
+                `Hubungi customer untuk menaikkan budget atau kurangi barang.`
+            );
+        }
+
+        // ── upload struk ──
+        const ext = (receipt.originalname.split('.').pop() ?? 'jpg').toLowerCase();
+        const fileName = `receipt-${orderId}-${Date.now()}.${ext}`;
+        const { error: upErr } = await supabaseAdmin.storage
+            .from('package-photos')
+            .upload(fileName, receipt.buffer, {
+                contentType: receipt.mimetype,
+                upsert: true,
+            });
+        if (upErr) {
+            logger.error('[order.confirmPurchase] Upload struk gagal', {
+                error: upErr.message,
+                orderId,
+            });
+            throw ApiError.internal('Gagal mengunggah struk');
+        }
+        const { data: urlData } = supabaseAdmin.storage
+            .from('package-photos')
+            .getPublicUrl(fileName);
+
+        // Tunai: customer hanya membayar sesuai struk, tidak ada refund.
+        const refund = isCashOrder ? 0 : budget - actualTotal;
+        const deliveryFee = Number(order.delivery_fee ?? 0);
+        const nowIso = new Date().toISOString();
+
+        // ── klaim transisi purchasing → in_progress secara atomik ──
+        // driver_earning tetap = ongkir. Uang talangan belanja diganti terpisah
+        // (tanpa komisi) oleh walletService.settleOrder saat order completed.
+        const { data: updated } = await supabaseAdmin
+            .from('orders')
+            .update({
+                status: 'in_progress',
+                started_at: nowIso,
+                purchased_at: nowIso,
+                actual_item_total: actualTotal,
+                receipt_photo_url: urlData.publicUrl,
+                subtotal: actualTotal,
+                total_fare: actualTotal + deliveryFee,
+                jastip_refund: refund > 0 ? refund : 0,
+            })
+            .eq('id', orderId)
+            .eq('status', 'purchasing')
+            .select()
+            .maybeSingle();
+
+        if (!updated) throw ApiError.conflict('Status order sudah berubah, muat ulang');
+
+        const itemResults = await Promise.all(
+            updates.map((u) =>
+                supabaseAdmin
+                    .from('order_items')
+                    .update({
+                        actual_price: u.actual_price,
+                        is_found: u.is_found,
+                        substitute_note: u.substitute_note,
+                        subtotal: u.actual_price * Number(byId.get(u.id).qty),
+                    })
+                    .eq('id', u.id)
+                    .eq('order_id', orderId)
+            )
+        );
+        const itemErr = itemResults.find((r) => r.error);
+        if (itemErr?.error) {
+            logger.error('[order.confirmPurchase] Update item gagal', {
+                orderId,
+                error: itemErr.error.message,
+            });
+        }
+
+        // ── refund selisih ke wallet customer (idempoten lewat jastip_refunded_at) ──
+        if (refund > 0) {
+            const { data: claimed } = await supabaseAdmin
+                .from('orders')
+                .update({ jastip_refunded_at: nowIso })
+                .eq('id', orderId)
+                .is('jastip_refunded_at', null)
+                .select('id')
+                .maybeSingle();
+
+            if (claimed) {
+                const { error: refErr } = await supabaseAdmin.rpc(
+                    'jastip_refund_to_wallet',
+                    {
+                        p_user_id: order.customer_id,
+                        p_order_id: orderId,
+                        p_amount: refund,
+                    }
+                );
+                if (refErr) {
+                    // lepas klaim supaya bisa dicoba ulang / diproses admin
+                    await supabaseAdmin
+                        .from('orders')
+                        .update({ jastip_refunded_at: null })
+                        .eq('id', orderId);
+                    logger.error('[order.confirmPurchase] PERLU REFUND MANUAL', {
+                        orderId,
+                        customerId: order.customer_id,
+                        refund,
+                        error: refErr.message,
+                    });
+                }
+            }
+        }
+
+        await notificationService
+            .sendToUser(order.customer_id, {
+                title: 'Belanjaan sudah dibeli 🛍️',
+                body: isCashOrder
+                    ? `Total belanja ${rp(actualTotal)}. Siapkan uang tunai ${rp(actualTotal + deliveryFee)} (belanja + ongkir) untuk driver.`
+                    : refund > 0
+                        ? `Total belanja ${rp(actualTotal)}. Selisih ${rp(refund)} dikembalikan ke saldo.`
+                        : `Total belanja ${rp(actualTotal)}. Driver menuju lokasimu.`,
+                data: {
+                    order_id: String(orderId),
+                    type: 'status_update',
+                    status: 'in_progress',
+                    service: 'jastip',
+                },
+            })
+            .catch(() => { });
+
+        logger.info('[order.confirmPurchase] ✅', { orderId, actualTotal, refund });
+        return updated;
+    },
+
 
     // ============================================================
     // GET BY ID

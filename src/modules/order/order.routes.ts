@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { orderController } from './order.controller';
 import { requireAuth, requireRole } from '../../middleware/auth';
 import { validate } from '../../middleware/validate';
+import { ApiError } from '@/utils/ApiError';
 import {
     createOrderSchema,
     updateStatusSchema,
@@ -56,4 +57,10 @@ router.post(
     orderController.uploadPackagePhoto
 );
 
+router.post(
+    '/:id/purchase',
+    requireRole('driver'),
+    upload.single('receipt'),
+    orderController.confirmPurchase
+);
 export default router;
