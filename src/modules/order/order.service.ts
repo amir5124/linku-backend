@@ -40,7 +40,7 @@ const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
 const MAX_JASTIP_ITEMS = 30;
 
 // Jastip TUNAI (customer bayar ke driver saat antar). Semua bisa diubah di tabel
-// `settings` tanpa deploy ulang:
+// `app_settings` tanpa deploy ulang:
 //   jastip_cash_max_budget  → batas belanja tunai (default 100000)
 //   jastip_cash_min_orders  → minimal order selesai customer (default 3; 0 = semua boleh)
 //   jastip_prepaid_max_budget → batas belanja prabayar (default 500000)
@@ -50,7 +50,7 @@ const JASTIP_CASH_MIN_ORDERS = 3;
 async function getNumberSetting(key: string, fallback: number): Promise<number> {
     try {
         const { data } = await supabaseAdmin
-            .from('settings')
+            .from('app_settings')
             .select('value')
             .eq('key', key)
             .maybeSingle();
@@ -558,7 +558,7 @@ export const orderService = {
         }
 
         const { data: setting } = await supabaseAdmin
-            .from('settings')
+            .from('app_settings')
             .select('value')
             .eq('key', 'order_accept_duration_sec')
             .maybeSingle();
@@ -1178,7 +1178,7 @@ export const orderService = {
         // dapat waktu penuh (pembayaran QRIS / konfirmasi toko bisa lama).
         {
             const { data: durSetting } = await supabaseAdmin
-                .from('settings')
+                .from('app_settings')
                 .select('value')
                 .eq('key', 'order_accept_duration_sec')
                 .maybeSingle();
