@@ -7,7 +7,9 @@ import { z } from 'zod';
 export const createOrderSchema = z
     .object({
         body: z.object({
-            type: z.enum(['ride', 'food', 'send']),
+            // ride | food | send | jastip
+            type: z.enum(['ride', 'food', 'send', 'jastip']),
+
             pickup_name: z.string(),
             pickup_address: z.string(),
             pickup_lat: z.number(),
@@ -38,17 +40,24 @@ export const createOrderSchema = z
             tariff_code: z.string().optional(),
             option_name: z.string().optional(),
 
+            // items: food pakai menu_item_id + price,
+            //        jastip pakai name + qty + est_price + variant (tanpa menu_item_id)
             items: z
                 .array(
                     z.object({
-                        menu_item_id: z.number(),
-                        name: z.string(),
-                        variant: z.string().optional(),
-                        qty: z.number(),
-                        price: z.number(),
+                        menu_item_id: z.number().int().optional(),
+                        name: z.string().max(120).optional(),
+                        variant: z.string().max(200).optional(),
+                        qty: z.number().int().min(1).max(99),
+                        price: z.number().min(0).optional(),
+                        est_price: z.number().min(0).optional(), // jastip
                     })
                 )
                 .optional(),
+
+            // ===== JASTIP =====
+            item_budget: z.number().positive().optional(),
+            shop_note: z.string().max(300).optional(),
 
             receiver_name: z.string().optional(),
             receiver_phone: z.string().optional(),
@@ -64,6 +73,7 @@ export const createOrderSchema = z
             package_protection: z.enum(['silver', 'gold']).optional(),
         }),
     })
+    // bank_transfer wajib bank_code
     .refine(
         (data) => {
             if (data.body.payment_method === 'bank_transfer') {
@@ -84,6 +94,27 @@ export const createOrderSchema = z
         {
             message: 'merchant_id dan items wajib untuk order makanan',
             path: ['body', 'merchant_id'],
+        }
+    )
+    // jastip wajib punya items + item_budget, dan tiap item punya nama & est_price
+    .refine(
+        (data) => {
+            if (data.body.type !== 'jastip') return true;
+            const items = data.body.items ?? [];
+            if (items.length === 0) return false;
+            if (!(data.body.item_budget && data.body.item_budget > 0)) return false;
+            return items.every(
+                (it) =>
+                    typeof it.name === 'string' &&
+                    it.name.trim().length > 0 &&
+                    typeof it.est_price === 'number' &&
+                    it.est_price >= 0
+            );
+        },
+        {
+            message:
+                'items (dengan name & est_price) dan item_budget wajib untuk order jastip',
+            path: ['body', 'items'],
         }
     );
 
