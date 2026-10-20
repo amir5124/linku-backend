@@ -46,6 +46,7 @@ const VA_MIN_AMOUNT = 10_000; // minimal transfer bank (VA) LinkQu
 //   jastip_cash_min_orders  → minimal order selesai customer (default 3; 0 = semua boleh)
 //   jastip_prepaid_max_budget → batas belanja prabayar (default 500000)
 const JASTIP_CASH_MAX_BUDGET = 100_000;
+const NO_RECEIPT_MAX_NONCASH = 100_000;
 const JASTIP_CASH_MIN_ORDERS = 3;
 
 async function getNumberSetting(key: string, fallback: number): Promise<number> {
@@ -1884,6 +1885,8 @@ export const orderService = {
                 is_found: boolean;
                 substitute_note?: string;
             }[];
+            no_receipt?: boolean;
+            no_receipt_note?: string;
         },
         receipt: { originalname: string; mimetype: string; buffer: Buffer }
     ) {
@@ -1905,8 +1908,17 @@ export const orderService = {
         if (!isCashOrder && order.payment_status !== 'paid') {
             throw ApiError.conflict('Pembayaran customer belum lunas');
         }
+
+        // Foto tetap wajib: struk asli, atau bukti belanja kalau toko tidak memberi struk
         if (!receipt?.buffer?.length) {
-            throw ApiError.badRequest('Foto struk wajib diunggah');
+            throw ApiError.badRequest('Foto struk / bukti belanja wajib diunggah');
+        }
+
+        // ── tanpa struk: alasan wajib ──
+        const noReceipt = input.no_receipt === true;
+        const noReceiptNote = String(input.no_receipt_note ?? '').trim().slice(0, 150);
+        if (noReceipt && noReceiptNote.length < 5) {
+            throw ApiError.badRequest('Alasan tidak ada struk wajib diisi');
         }
 
         const { data: dbItems } = await supabaseAdmin
@@ -1960,7 +1972,15 @@ export const orderService = {
             );
         }
 
-        // ── upload struk ──
+        // ── batas tanpa struk untuk order non-tunai ──
+        if (noReceipt && !isCashOrder && actualTotal > NO_RECEIPT_MAX_NONCASH) {
+            throw ApiError.badRequest(
+                `Belanja di atas ${rp(NO_RECEIPT_MAX_NONCASH)} wajib pakai struk. ` +
+                `Hubungi customer atau admin.`
+            );
+        }
+
+        // ── upload struk / bukti belanja ──
         const ext = (receipt.originalname.split('.').pop() ?? 'jpg').toLowerCase();
         const fileName = `receipt-${orderId}-${Date.now()}.${ext}`;
         const { error: upErr } = await supabaseAdmin.storage
@@ -1996,6 +2016,8 @@ export const orderService = {
                 purchased_at: nowIso,
                 actual_item_total: actualTotal,
                 receipt_photo_url: urlData.publicUrl,
+                no_receipt: noReceipt,
+                no_receipt_note: noReceipt ? noReceiptNote : null,
                 subtotal: actualTotal,
                 total_fare: actualTotal + deliveryFee,
                 jastip_refund: refund > 0 ? refund : 0,
@@ -2081,10 +2103,14 @@ export const orderService = {
             })
             .catch(() => { });
 
-        logger.info('[order.confirmPurchase] ✅', { orderId, actualTotal, refund });
+        logger.info('[order.confirmPurchase] ✅', {
+            orderId,
+            actualTotal,
+            refund,
+            noReceipt,
+        });
         return updated;
     },
-
 
     // ============================================================
     // GET BY ID

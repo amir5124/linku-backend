@@ -110,7 +110,7 @@ export const orderController = {
 
     confirmPurchase: asyncHandler(async (req: Request, res: Response) => {
         if (!req.file) {
-            throw ApiError.badRequest('Foto struk wajib diunggah');
+            throw ApiError.badRequest('Foto struk / bukti belanja wajib diunggah');
         }
 
         let items: unknown;
@@ -124,10 +124,21 @@ export const orderController = {
             throw ApiError.badRequest('Items pembelian wajib diisi');
         }
 
+        // multipart mengirim semua field sebagai string
+        const noReceipt =
+            req.body.no_receipt === 'true' || req.body.no_receipt === '1';
+        const noReceiptNote = req.body.no_receipt_note
+            ? String(req.body.no_receipt_note)
+            : undefined;
+
         const data = await orderService.confirmPurchase(
             Number(req.params.id),
             req.user!.id,
-            { items },
+            {
+                items,
+                no_receipt: noReceipt,
+                no_receipt_note: noReceiptNote,
+            },
             req.file
         );
 
