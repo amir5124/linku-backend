@@ -35,7 +35,7 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 };
 
 // ── Jastip ──
-const JASTIP_DEFAULT_TARIFF = 'warjastip';
+const JASTIP_DEFAULT_TARIFF = 'ujastip';
 const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
 const MAX_JASTIP_ITEMS = 30;
 const VA_MIN_AMOUNT = 10_000; // minimal transfer bank (VA) LinkQu

@@ -263,11 +263,11 @@ export const driverService = {
             if (current?.services) {
                 // Cek apakah ada service motor-only yang tidak kompatibel
                 const motorOnlyServices = [
-                    'warjek_s',
-                    'warjek_l',
-                    'warsend_s',
-                    'warsend_l',
-                    'warfood',
+                    'uride_s',
+                    'uride_l',
+                    'usend_s',
+                    'usend_l',
+                    'ufood',
                 ];
                 const incompatible = current.services.filter((s: string) =>
                     motorOnlyServices.includes(s)
@@ -333,13 +333,13 @@ export const driverService = {
         // 🆕 3. Mapping service → kendaraan yang cocok
         // (samakan dengan frontend edit-services.tsx)
         const SERVICE_VEHICLE_RULES: Record<string, ('motor' | 'mobil')[]> = {
-            warjek_s: ['motor'],
-            warjek_l: ['motor'],
-            warsend_s: ['motor'],
-            warsend_l: ['motor'],
-            warfood: ['motor'],         // 🆕 motor bisa WarFood
-            warcar_s: ['mobil'],
-            warcar_l: ['mobil'],
+            uride_s: ['motor'],
+            uride_l: ['motor'],
+            usend_s: ['motor'],
+            usend_l: ['motor'],
+            ufood: ['motor'],
+            ucar_s: ['mobil'],
+            ucar_l: ['mobil'],
         };
 
         // 🆕 4. Filter service yang tidak cocok dengan kendaraan
