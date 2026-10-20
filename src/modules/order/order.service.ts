@@ -35,9 +35,10 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 };
 
 // ── Jastip ──
-const JASTIP_DEFAULT_TARIFF = 'ujastip';
+const JASTIP_DEFAULT_TARIFF = 'warjastip';
 const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
 const MAX_JASTIP_ITEMS = 30;
+const VA_MIN_AMOUNT = 10_000; // minimal transfer bank (VA) LinkQu
 
 // Jastip TUNAI (customer bayar ke driver saat antar). Semua bisa diubah di tabel
 // `app_settings` tanpa deploy ulang:
@@ -500,6 +501,14 @@ export const orderService = {
         if (paymentMethod === 'bank_transfer' && !input.bank_code) {
             throw ApiError.badRequest(
                 'bank_code wajib diisi untuk metode transfer bank'
+            );
+        }
+
+        // Minimal VA LinkQu (sama dengan validasi di app)
+        if (paymentMethod === 'bank_transfer' && total_fare < VA_MIN_AMOUNT) {
+            throw ApiError.badRequest(
+                `Transfer bank (VA) minimal ${rp(VA_MIN_AMOUNT)}. Total pesananmu ${rp(total_fare)}. ` +
+                `Gunakan QRIS / saldo, atau tambah belanjaan.`
             );
         }
 

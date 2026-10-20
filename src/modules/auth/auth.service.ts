@@ -103,4 +103,87 @@ export const authService = {
             .maybeSingle();
         return data;
     },
+
+    // Selalu diam-diam: jangan bocorkan apakah email terdaftar
+    async forgotPassword(email: string) {
+        const normalized = email.trim().toLowerCase();
+
+        const { data: profile } = await supabaseAdmin
+            .from('profiles')
+            .select('id, is_active')
+            .eq('email', normalized)
+            .maybeSingle();
+
+        if (!profile || profile.is_active === false) return;
+
+        const authClient = createAuthClient();
+        const { error } = await authClient.auth.resetPasswordForEmail(normalized);
+        if (error) {
+            logger.warn('resetPasswordForEmail gagal', { email: normalized, error: error.message });
+        }
+    },
+
+    async resetPassword(input: { email: string; code: string; new_password: string }) {
+        const email = input.email.trim().toLowerCase();
+        const invalid = () => ApiError.badRequest('Kode salah atau sudah kedaluwarsa');
+
+        const { data: profile } = await supabaseAdmin
+            .from('profiles')
+            .select('id, is_active')
+            .eq('email', email)
+            .maybeSingle();
+        if (!profile || profile.is_active === false) throw invalid();
+
+        // Verifikasi kode (sekali pakai, kedaluwarsa diatur di Supabase)
+        const authClient = createAuthClient();
+        const { data, error } = await authClient.auth.verifyOtp({
+            email,
+            token: input.code,
+            type: 'recovery',
+        });
+        if (error || !data?.user || data.user.id !== profile.id) {
+            logger.warn('Reset password: kode ditolak', { email, error: error?.message });
+            throw invalid();
+        }
+
+        const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(profile.id, {
+            password: input.new_password,
+        });
+        if (updErr) {
+            logger.error('Reset password: update gagal', { userId: profile.id, error: updErr.message });
+            throw ApiError.internal('Gagal mengganti password');
+        }
+        logger.info('Password direset', { userId: profile.id });
+    },
+
+    async changePassword(userId: string, current: string, next: string) {
+        if (current === next) {
+            throw ApiError.badRequest('Password baru harus berbeda dari password lama');
+        }
+
+        const { data: profile } = await supabaseAdmin
+            .from('profiles')
+            .select('id, email')
+            .eq('id', userId)
+            .maybeSingle();
+        if (!profile?.email) throw ApiError.notFound('Akun tidak ditemukan');
+
+        // Verifikasi password lama
+        const authClient = createAuthClient();
+        const { error } = await authClient.auth.signInWithPassword({
+            email: profile.email,
+            password: current,
+        });
+        // 400, BUKAN 401: app Anda menganggap 401 sebagai sesi habis lalu logout otomatis
+        if (error) throw ApiError.badRequest('Password lama salah');
+
+        const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+            password: next,
+        });
+        if (updErr) {
+            logger.error('Ganti password gagal', { userId, error: updErr.message });
+            throw ApiError.internal('Gagal mengganti password');
+        }
+        logger.info('Password diganti', { userId });
+    },
 };

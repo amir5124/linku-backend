@@ -55,6 +55,31 @@ const page = (o: { limit?: any; offset?: any }) => ({
     limit: Math.min(Math.max(Number(o.limit) || 20, 1), 100),
     offset: Math.max(Number(o.offset) || 0, 0),
 });
+
+function parseDateParam(
+    raw: string | undefined,
+    opts: { endOfDay?: boolean } = {}
+): string | null {
+    if (!raw) return null;
+    const s = raw.trim();
+    if (!s) return null;
+
+    // Format YYYY-MM-DD → interpretasi sebagai WIB
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+        const [y, m, d] = s.split('-').map(Number);
+        const baseUtc = Date.UTC(y, m - 1, d);
+        // akhir hari eksklusif: +1 hari (jadi query pakai lt untuk `to`)
+        const offset = opts.endOfDay ? 24 * 60 * 60 * 1000 : 0;
+        return new Date(baseUtc - WIB_MS + offset).toISOString();
+    }
+
+    // ISO lengkap
+    const parsed = new Date(s);
+    if (Number.isNaN(parsed.getTime())) {
+        throw ApiError.badRequest(`Tanggal tidak valid: "${s}"`);
+    }
+    return parsed.toISOString();
+}
 /** Bersihkan input pencarian dari karakter khusus filter PostgREST */
 const cleanSearch = (s?: string) => (s ?? '').replace(/[%_,()*\\]/g, '').trim();
 const chunk = <X,>(a: X[], n: number): X[][] =>
@@ -266,8 +291,26 @@ async function enrichOrders(rows: any[]) {
     }));
 }
 
-export async function listOrders(opts: { status?: string; search?: string; limit?: any; offset?: any }) {
+export async function listOrders(opts: {
+    status?: string;
+    search?: string;
+    from?: string;   // ← BARU
+    to?: string;     // ← BARU
+    limit?: any;
+    offset?: any;
+}) {
     const { limit, offset } = page(opts);
+
+    // ── Parse tanggal ──
+    // `from` → awal hari WIB
+    // `to`   → awal hari berikutnya (eksklusif) supaya tanggal `to` ikut terhitung
+    const fromISO = parseDateParam(opts.from);
+    const toISO = parseDateParam(opts.to, { endOfDay: true });
+
+    if (fromISO && toISO && new Date(fromISO) > new Date(toISO)) {
+        throw ApiError.badRequest('Tanggal "from" harus sebelum "to"');
+    }
+
     let q = sb
         .from(T.orders)
         .select('*', { count: 'exact' })
@@ -276,13 +319,19 @@ export async function listOrders(opts: { status?: string; search?: string; limit
 
     const group = opts.status ? STATUS_GROUPS[opts.status] : undefined;
     if (group) q = q.in('status', group);
+
     const term = cleanSearch(opts.search);
     if (term) q = q.ilike('order_code', `%${term}%`);
+
+    // ── Filter tanggal ──
+    if (fromISO) q = q.gte('created_at', fromISO);
+    if (toISO) q = q.lt('created_at', toISO);   // lt karena to sudah = awal hari berikutnya
 
     const { data, error, count } = await q;
     if (error) throw dbError('orders', error);
     return { items: await enrichOrders(data ?? []), total: count ?? 0 };
 }
+
 
 export async function getOrder(id: string) {
     const { data, error } = await sb.from(T.orders).select('*').eq('id', id).maybeSingle();

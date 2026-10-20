@@ -125,12 +125,17 @@ export const createOrderSchema = z
 // ============================================================
 export const updateStatusSchema = z.object({
     body: z.object({
-        status: z.enum(['arrived', 'in_progress', 'completed', 'cancelled']),
+        status: z.enum([
+            'arrived',
+            'purchasing', // khusus jastip: driver mulai belanja
+            'in_progress',
+            'completed',
+            'cancelled',
+        ]),
         reason: z.string().optional(),
         send_code: z.string().optional(),
     }),
 });
-
 // ============================================================
 // RESPONS MERCHANT
 // ============================================================

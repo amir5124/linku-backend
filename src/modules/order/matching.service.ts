@@ -24,7 +24,7 @@ const MATCH_LIMIT = 20;
  * (LinkU: 'ufood').
  */
 const DEFAULT_TARIFF_BY_TYPE: Record<string, string | undefined> = {
-    food: process.env.FOOD_TARIFF_CODE ?? 'ufood',
+    food: process.env.FOOD_TARIFF_CODE ?? 'warfood',
 };
 
 // ============================================================
@@ -35,7 +35,7 @@ const DEFAULT_TARIFF_BY_TYPE: Record<string, string | undefined> = {
  * Filter layanan di find_nearby_drivers memakai kode tarif ini (bukan 'jastip'),
  * supaya order jastip sampai ke driver motor. Ubah lewat env JASTIP_MATCH_TARIFF.
  */
-const JASTIP_MATCH_TARIFF = process.env.JASTIP_MATCH_TARIFF ?? 'uride_s';
+const JASTIP_MATCH_TARIFF = process.env.JASTIP_MATCH_TARIFF ?? 'warsend_s';
 
 export type NearbyDriverResult = {
     user_id: string;

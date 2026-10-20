@@ -18,6 +18,11 @@ router.use('/commission-rates', commissionRoutes);
 router.get('/stats', adminController.stats);
 router.get('/dashboard', adminController.dashboard);
 
+router.get('/accounts/summary', adminController.accountsSummary);
+router.get('/accounts', adminController.listAccounts);
+router.get('/accounts/:id', adminController.getAccount);
+router.post('/accounts/:id/adjust-balance', adminController.adjustBalance);
+
 // Pesanan
 router.get('/orders', adminController.listOrders);
 router.get('/orders/:id', adminController.getOrder);

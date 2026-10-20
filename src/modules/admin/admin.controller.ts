@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../../config/supabase';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok } from '../../utils/response';
 import * as svc from './admin.service';
+import * as acc from './admin-accounts.service';
 
 // SESUAIKAN: bentuk req.user dari middleware requireAuth
 const adminIdOf = (req: Request) => (req as any).user?.id as string | undefined;
@@ -47,6 +48,27 @@ export const adminController = {
         return ok(res, await svc.getDashboard());
     }),
 
+    accountsSummary: asyncHandler(async (_req: Request, res: Response) => {
+        return ok(res, await acc.accountsSummary());
+    }),
+    listAccounts: asyncHandler(async (req: Request, res: Response) => {
+        return ok(res, await acc.listAccounts({
+            role: str(req.query.role), search: str(req.query.search),
+            limit: req.query.limit, offset: req.query.offset,
+        }));
+    }),
+    getAccount: asyncHandler(async (req: Request, res: Response) => {
+        return ok(res, await acc.getAccount(req.params.id));
+    }),
+    adjustBalance: asyncHandler(async (req: Request, res: Response) => {
+        const { direction, amount, reason } = req.body ?? {};
+        return ok(
+            res,
+            await acc.adjustBalance(req.params.id, { direction, amount: Number(amount), reason }, adminIdOf(req)),
+            'Saldo disesuaikan'
+        );
+    }),
+
     // ── Pesanan ──
     listOrders: asyncHandler(async (req: Request, res: Response) => {
         return ok(
@@ -54,6 +76,8 @@ export const adminController = {
             await svc.listOrders({
                 status: str(req.query.status),
                 search: str(req.query.search),
+                from: str(req.query.from),      // ← BARU
+                to: str(req.query.to),          // ← BARU
                 limit: req.query.limit,
                 offset: req.query.offset,
             })
