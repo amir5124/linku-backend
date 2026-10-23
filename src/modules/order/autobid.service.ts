@@ -1,6 +1,7 @@
 // src/modules/order/autobid.service.ts
 import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
+import { assertDriverCanAccept } from './driver-eligibility';
 
 export const autobidService = {
     /**
@@ -49,6 +50,11 @@ export const autobidService = {
             return { eligible: false, reason: 'not_verified' };
         }
 
+        try {
+            await assertDriverCanAccept(driverId);
+        } catch {
+            return { eligible: false, reason: 'low_balance' };
+        }
         // ═══════════════════════════════════════════════════════════
         // 3. Cek jam aktif (WIB) — ✅ FIX TIMEZONE
         // ═══════════════════════════════════════════════════════════

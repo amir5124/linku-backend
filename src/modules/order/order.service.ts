@@ -5,7 +5,7 @@ import { matchingService } from './matching.service';
 import { notificationService } from '../notification/notification.service';
 import { merchantWalletService } from '../wallet/merchant-wallet.service';
 import { logger } from '../../config/logger';
-
+import { assertDriverCanAccept } from './driver-eligibility';
 import {
     kindOf,
     newOrderForDriver,
@@ -1442,6 +1442,8 @@ export const orderService = {
             logger.warn('[order.accept] Driver belum verified', { driverId });
             throw ApiError.forbidden('Akun belum terverifikasi');
         }
+
+        await assertDriverCanAccept(driverId);   // ← di luar if, satu baris saja
 
         const { data, error } = await supabaseAdmin
             .from('orders')
