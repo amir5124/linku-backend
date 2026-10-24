@@ -3,6 +3,7 @@ import { Router, Request, Response } from 'express';
 import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';
+import { walletService } from './wallet.service';
 
 const router = Router();
 
@@ -116,6 +117,7 @@ router.post('/callback', async (req: Request, res: Response) => {
 
 // ============================================================
 // HANDLER: TOPUP CALLBACK
+// Dompet tujuan dibaca dari topup.wallet_type (disimpan saat inquiry).
 // ============================================================
 async function handleTopupCallback(
     topup: any,
@@ -169,21 +171,37 @@ async function handleTopupCallback(
     }
 
     // ═══════════════════════════════════════════════════════════
-    // HITUNG NOMINAL & FEE
+    // KLAIM ATOMIK — hanya satu callback yang boleh mengkredit saldo
     // ═══════════════════════════════════════════════════════════
-    const userId = topup.user_id;
+    const { data: claimed, error: claimErr } = await supabaseAdmin
+        .from('wallet_topups')
+        .update({
+            status: 'SUCCESS',
+            updated_at: new Date().toISOString(),
+        })
+        .eq('id', topup.id)
+        .neq('status', 'SUCCESS')
+        .select('id')
+        .maybeSingle();
 
+    if (claimErr) throw new Error(`Klaim topup gagal: ${claimErr.message}`);
+    if (!claimed) {
+        logger.info('ℹ️ Topup sudah diproses callback lain, skip', {
+            partner_reff: topup.partner_reff,
+        });
+        return;
+    }
+
+    const userId = topup.user_id;
     const nominal = Number(topup.nominal ?? topup.amount);
     const adminFee = Number(topup.admin_fee ?? 0);
     const totalBayar = Number(topup.amount);
+    const netAmount = nominal; // yang masuk saldo = nominal
 
-    // ✅ Yang masuk saldo = nominal
-    const netAmount = nominal;
-
-    logger.info('💰 Fee admin', {
+    logger.info('💰 Topup dikreditkan', {
         partner_reff: topup.partner_reff,
+        wallet_type: topup.wallet_type ?? 'customer',
         method: topup.method,
-        bankCode: topup.bank_code,
         totalBayar,
         nominal,
         adminFee,
@@ -191,196 +209,60 @@ async function handleTopupCallback(
     });
 
     // ═══════════════════════════════════════════════════════════
-    // CEK APAKAH USER = DRIVER
+    // KREDIT KE DOMPET SESUAI wallet_type
     // ═══════════════════════════════════════════════════════════
-    const { data: driverProfile } = await supabaseAdmin
-        .from('driver_profiles')
-        .select('user_id')
-        .eq('user_id', userId)
-        .maybeSingle();
-
-    const isDriver = !!driverProfile;
-
-    // ═══════════════════════════════════════════════════════════
-    // DRIVER
-    // ═══════════════════════════════════════════════════════════
-    if (isDriver) {
+    try {
+        await walletService.creditTopup(topup, { va_code, serialnumber });
+    } catch (err: any) {
+        // Saldo belum dikreditkan → kembalikan status supaya callback berikutnya
+        // (atau cek status manual) bisa mencoba lagi.
         await supabaseAdmin
-            .from('driver_wallets')
-            .upsert(
-                { driver_id: userId },
-                { onConflict: 'driver_id', ignoreDuplicates: true }
-            );
-
-        const { data: wallet } = await supabaseAdmin
-            .from('driver_wallets')
-            .select('*')
-            .eq('driver_id', userId)
-            .single();
-
-        let newBalance = Number(wallet?.balance ?? 0);
-        let newCashDebt = Number(wallet?.cash_debt ?? 0);
-        let amountLeft = netAmount;
-
-        // ── LANGKAH 1: Lunasi utang cash DULU ──
-        let debtPaid = 0;
-        if (newCashDebt > 0) {
-            debtPaid = Math.min(newCashDebt, amountLeft);
-            newCashDebt = newCashDebt - debtPaid;
-            amountLeft = amountLeft - debtPaid;
-        }
-
-        // ── LANGKAH 2: Sisa masuk saldo ──
-        newBalance = newBalance + amountLeft;
-
-        // ── LANGKAH 3: Update wallet ──
-        await supabaseAdmin
-            .from('driver_wallets')
+            .from('wallet_topups')
             .update({
-                balance: newBalance,
-                cash_debt: newCashDebt,
-                total_commission_owed: newCashDebt,
+                status: topup.status,
                 updated_at: new Date().toISOString(),
             })
-            .eq('driver_id', userId);
+            .eq('id', topup.id);
 
-        // ── LANGKAH 4: Ledger topup ──
-        await supabaseAdmin.from('driver_wallet_ledger').insert({
-            driver_id: userId,
-            entry_type: 'topup',
-            amount: netAmount,
-            direction: 'in',
-            balance_after: newBalance,
-            cash_debt_after: newCashDebt,
-            description: `Topup via ${topup.method?.toUpperCase() ?? 'LinkQu'
-                } (nominal Rp${nominal.toLocaleString(
-                    'id-ID'
-                )} + fee Rp${adminFee.toLocaleString('id-ID')})`,
-            metadata: {
-                partner_reff: topup.partner_reff,
-                va_code,
-                serialnumber,
-                total_bayar: totalBayar,
+        logger.error('❌ Topup gagal dikreditkan, status dikembalikan', {
+            partner_reff: topup.partner_reff,
+            error: err.message,
+        });
+        throw err;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // NOTIFIKASI SUKSES (kegagalan notif tidak boleh membatalkan topup)
+    // ═══════════════════════════════════════════════════════════
+    try {
+        await notificationService.sendToUser(userId, {
+            title: 'Topup Berhasil',
+            body: `Saldo Rp${netAmount.toLocaleString(
+                'id-ID'
+            )} sudah masuk (fee admin Rp${adminFee.toLocaleString('id-ID')}).`,
+            data: {
+                type: 'topup_success',
+                amount: netAmount,
                 nominal,
+                total_bayar: totalBayar,
                 admin_fee: adminFee,
-                net_amount: netAmount,
-                debt_paid: debtPaid,
+                partner_reff: topup.partner_reff,
             },
         });
-
-        // ── LANGKAH 5: Ledger pelunasan utang ──
-        if (debtPaid > 0) {
-            await supabaseAdmin.from('driver_wallet_ledger').insert({
-                driver_id: userId,
-                entry_type: 'debt_payment',
-                amount: debtPaid,
-                direction: 'out',
-                balance_after: newBalance,
-                cash_debt_after: newCashDebt,
-                description: 'Pelunasan utang cash dari topup',
-                metadata: {
-                    debt_paid: debtPaid,
-                    source: 'topup',
-                    partner_reff: topup.partner_reff,
-                },
-            });
-        }
-
-        logger.info('✅ Topup SUCCESS (driver)', {
+    } catch (err: any) {
+        logger.warn('Gagal kirim notif topup sukses', {
             partner_reff: topup.partner_reff,
-            userId,
-            totalBayar,
-            nominal,
-            adminFee,
-            netAmount,
-            debtPaid,
-            newBalance,
-            newCashDebt,
+            error: err.message,
         });
     }
-
-    // ═══════════════════════════════════════════════════════════
-    // CUSTOMER
-    // ═══════════════════════════════════════════════════════════
-    else {
-        await supabaseAdmin
-            .from('wallets')
-            .upsert(
-                { user_id: userId },
-                { onConflict: 'user_id', ignoreDuplicates: true }
-            );
-
-        const { data: wallet } = await supabaseAdmin
-            .from('wallets')
-            .select('*')
-            .eq('user_id', userId)
-            .single();
-
-        const newBalance = Number(wallet?.balance ?? 0) + netAmount;
-
-        await supabaseAdmin
-            .from('wallets')
-            .update({
-                balance: newBalance,
-                updated_at: new Date().toISOString(),
-            })
-            .eq('user_id', userId);
-
-        await supabaseAdmin.from('wallet_transactions').insert({
-            user_id: userId,
-            type: 'topup',
-            amount: netAmount,
-            balance_after: newBalance,
-            reference_id: topup.partner_reff,
-            description: `Topup via ${topup.method?.toUpperCase() ?? 'LinkQu'
-                } (nominal Rp${nominal.toLocaleString(
-                    'id-ID'
-                )} + fee Rp${adminFee.toLocaleString('id-ID')})`,
-        });
-
-        logger.info('✅ Topup SUCCESS (customer)', {
-            partner_reff: topup.partner_reff,
-            userId,
-            totalBayar,
-            nominal,
-            adminFee,
-            netAmount,
-            newBalance,
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // UPDATE STATUS TOPUP → SUCCESS
-    // ═══════════════════════════════════════════════════════════
-    await supabaseAdmin
-        .from('wallet_topups')
-        .update({
-            status: 'SUCCESS',
-            updated_at: new Date().toISOString(),
-        })
-        .eq('id', topup.id);
-
-    // ═══════════════════════════════════════════════════════════
-    // NOTIFIKASI SUKSES
-    // ═══════════════════════════════════════════════════════════
-    await notificationService.sendToUser(userId, {
-        title: 'Topup Berhasil',
-        body: `Saldo Rp${netAmount.toLocaleString(
-            'id-ID'
-        )} sudah masuk (fee admin Rp${adminFee.toLocaleString('id-ID')}).`,
-        data: {
-            type: 'topup_success',
-            amount: netAmount,
-            nominal,
-            total_bayar: totalBayar,
-            admin_fee: adminFee,
-            partner_reff: topup.partner_reff,
-        },
-    });
 }
 
 // ============================================================
 // HANDLER: WITHDRAW CALLBACK
+//
+// Refund memakai walletService.refundWithdrawal(wd): dompet yang
+// di-refund = wd.wallet_type (sama dengan dompet yang dipotong),
+// dan aman dipanggil berulang (klaim atomik lewat refunded_at).
 // ============================================================
 async function handleWithdrawCallback(wd: any, status: string) {
     const isSuccess = status === 'SUCCESS' || status === 'SETTLED';
@@ -443,82 +325,29 @@ async function handleWithdrawCallback(wd: any, status: string) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // HANDLE FAILED (+ REFUND TOTAL)
+    // HANDLE FAILED (+ REFUND TOTAL ke dompet asal)
     // ═══════════════════════════════════════════════════════════
     if (isFailed) {
+        // Belum pernah dieksekusi -> saldo belum dipotong -> jangan refund
+        if (wd.status === 'INQUIRY') {
+            logger.warn('⚠️ Callback FAILED untuk inquiry yang belum dieksekusi, skip', {
+                inquiry_reff: wd.inquiry_reff,
+            });
+            return;
+        }
+        // Sudah SUCCESS -> uang sudah sampai ke rekening -> jangan refund
+        if (wd.status === 'SUCCESS') {
+            logger.warn('🚨 Callback FAILED untuk withdraw yang sudah SUCCESS — cek manual', {
+                inquiry_reff: wd.inquiry_reff,
+            });
+            return;
+        }
+
         const userId = wd.user_id;
 
-        const { data: driverProfile } = await supabaseAdmin
-            .from('driver_profiles')
-            .select('user_id')
-            .eq('user_id', userId)
-            .maybeSingle();
-
-        const isDriver = !!driverProfile;
-
-        if (isDriver) {
-            const { data: wallet } = await supabaseAdmin
-                .from('driver_wallets')
-                .select('*')
-                .eq('driver_id', userId)
-                .single();
-
-            const newBalance =
-                Number(wallet?.balance ?? 0) + totalDeduction;
-            const cashDebt = Number(wallet?.cash_debt ?? 0);
-
-            await supabaseAdmin
-                .from('driver_wallets')
-                .update({ balance: newBalance })
-                .eq('driver_id', userId);
-
-            await supabaseAdmin.from('driver_wallet_ledger').insert({
-                driver_id: userId,
-                entry_type: 'adjustment',
-                amount: totalDeduction,
-                direction: 'in',
-                balance_after: newBalance,
-                cash_debt_after: cashDebt,
-                description:
-                    `Refund withdraw gagal #${wd.inquiry_reff} ` +
-                    `(nominal Rp${nominal.toLocaleString(
-                        'id-ID'
-                    )} + fee Rp${feeAdmin.toLocaleString('id-ID')})`,
-                metadata: {
-                    inquiry_reff: wd.inquiry_reff,
-                    nominal,
-                    fee_admin: feeAdmin,
-                    total_refund: totalDeduction,
-                },
-            });
-        } else {
-            const { data: wallet } = await supabaseAdmin
-                .from('wallets')
-                .select('*')
-                .eq('user_id', userId)
-                .single();
-
-            const newBalance =
-                Number(wallet?.balance ?? 0) + totalDeduction;
-
-            await supabaseAdmin
-                .from('wallets')
-                .update({ balance: newBalance })
-                .eq('user_id', userId);
-
-            await supabaseAdmin.from('wallet_transactions').insert({
-                user_id: userId,
-                type: 'withdraw_refund',
-                amount: totalDeduction,
-                balance_after: newBalance,
-                reference_id: wd.inquiry_reff,
-                description:
-                    `Refund withdraw gagal ` +
-                    `(nominal Rp${nominal.toLocaleString(
-                        'id-ID'
-                    )} + fee Rp${feeAdmin.toLocaleString('id-ID')})`,
-            });
-        }
+        // Refund atomik & idempotent; throw kalau gagal (status tidak diubah
+        // supaya callback berikutnya bisa mencoba lagi)
+        const { refunded } = await walletService.refundWithdrawal(wd);
 
         await supabaseAdmin
             .from('wallet_withdrawals')
@@ -529,24 +358,34 @@ async function handleWithdrawCallback(wd: any, status: string) {
             })
             .eq('id', wd.id);
 
-        await notificationService.sendToUser(userId, {
-            title: 'Penarikan Gagal',
-            body:
-                `Penarikan Rp${nominal.toLocaleString('id-ID')} gagal. ` +
-                `Saldo Rp${totalDeduction.toLocaleString(
-                    'id-ID'
-                )} sudah dikembalikan.`,
-            data: {
-                type: 'withdraw_failed',
-                amount: nominal,
-                fee_admin: feeAdmin,
-                total_refund: totalDeduction,
+        if (!refunded) return; // callback ganda: refund & notif sudah terkirim sebelumnya
+
+        try {
+            await notificationService.sendToUser(userId, {
+                title: 'Penarikan Gagal',
+                body:
+                    `Penarikan Rp${nominal.toLocaleString('id-ID')} gagal. ` +
+                    `Saldo Rp${totalDeduction.toLocaleString(
+                        'id-ID'
+                    )} sudah dikembalikan.`,
+                data: {
+                    type: 'withdraw_failed',
+                    amount: nominal,
+                    fee_admin: feeAdmin,
+                    total_refund: totalDeduction,
+                    inquiry_reff: wd.inquiry_reff,
+                },
+            });
+        } catch (err: any) {
+            logger.warn('Gagal kirim notif withdraw gagal', {
                 inquiry_reff: wd.inquiry_reff,
-            },
-        });
+                error: err.message,
+            });
+        }
 
         logger.info('❌ Withdraw FAILED + refund total', {
             inquiry_reff: wd.inquiry_reff,
+            walletType: wd.wallet_type ?? 'customer',
             userId,
             nominal,
             feeAdmin,

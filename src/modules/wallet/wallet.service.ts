@@ -5,6 +5,7 @@ import { supabaseAdmin } from '../../config/supabase';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';  // ✅ TAMBAH
+import { merchantWalletService } from './merchant-wallet.service';
 
 // ============================================================
 // KONFIGURASI LINKQU
@@ -96,6 +97,19 @@ type WalletRow = {
     updated_at: string;
 };
 
+// Dompet tujuan uang masuk/keluar. Disimpan di wallet_topups & wallet_withdrawals.
+export type WalletType = 'customer' | 'driver' | 'merchant';
+
+type DriverLedgerDraft = {
+    entry_type: string;
+    amount: number;
+    direction: 'in' | 'out';
+    balance_after: number;
+    cash_debt_after: number;
+    description: string;
+    metadata?: Record<string, any>;
+};
+
 export type DriverWallet = {
     balance: number;
     cash_debt: number;
@@ -183,11 +197,447 @@ class WalletService {
     }
 
     // ============================================================
-    // SETTLE ORDER — FINAL (Fixed: auto-lunasi utang dari saldo aktif)
+    // HELPER — mutasi dompet DRIVER (optimistic lock via updated_at)
+    // Baca -> hitung -> update hanya kalau updated_at belum berubah.
+    // Kalau berubah (ada transaksi lain di tengah jalan), ulangi.
+    // compute() HARUS murni (tidak ada efek samping) karena bisa dijalankan ulang.
+    // ============================================================
+    private async mutateDriver<T>(
+        driverId: string,
+        orderId: number | null,
+        compute: (w: WalletRow) => {
+            patch: Record<string, number>;
+            ledger: DriverLedgerDraft[];
+            result: T;
+        }
+    ): Promise<T> {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            await supabaseAdmin
+                .from('driver_wallets')
+                .upsert(
+                    { driver_id: driverId },
+                    { onConflict: 'driver_id', ignoreDuplicates: true }
+                );
+
+            const { data, error } = await supabaseAdmin
+                .from('driver_wallets')
+                .select('*')
+                .eq('driver_id', driverId)
+                .single();
+            if (error || !data) throw ApiError.internal('Wallet driver tidak ditemukan');
+
+            const w = data as unknown as WalletRow;
+            const { patch, ledger, result } = compute(w);
+
+            let q: any = supabaseAdmin
+                .from('driver_wallets')
+                .update({ ...patch, updated_at: new Date().toISOString() })
+                .eq('driver_id', driverId);
+            q = w.updated_at == null ? q.is('updated_at', null) : q.eq('updated_at', w.updated_at);
+
+            const { data: updated, error: uErr } = await q.select('driver_id');
+            if (uErr) {
+                logger.error('Update wallet driver gagal', { error: uErr, driverId });
+                throw ApiError.internal('Gagal update wallet driver');
+            }
+            if (!updated || updated.length === 0) continue; // wallet berubah, ulangi
+
+            if (ledger.length > 0) {
+                const { error: lErr } = await supabaseAdmin
+                    .from('driver_wallet_ledger')
+                    .insert(
+                        ledger.map((l) => ({
+                            driver_id: driverId,
+                            order_id: orderId,
+                            metadata: {},
+                            ...l,
+                        }))
+                    );
+                if (lErr) {
+                    logger.error('Insert ledger driver gagal', { error: lErr, driverId, orderId });
+                }
+            }
+            return result;
+        }
+        throw ApiError.internal('Wallet driver sedang sibuk, coba lagi');
+    }
+
+    // ============================================================
+    // HELPER — mutasi dompet CUSTOMER (tabel wallets), optimistic lock
+    // ============================================================
+    private async mutateCustomer<T>(
+        userId: string,
+        compute: (balance: number) => {
+            newBalance: number;
+            tx?: {
+                type: string;
+                amount: number;
+                reference_id: string | null;
+                description: string;
+            };
+            result: T;
+        }
+    ): Promise<T> {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            await supabaseAdmin
+                .from('wallets')
+                .upsert(
+                    { user_id: userId },
+                    { onConflict: 'user_id', ignoreDuplicates: true }
+                );
+
+            const { data, error } = await supabaseAdmin
+                .from('wallets')
+                .select('*')
+                .eq('user_id', userId)
+                .single();
+            if (error || !data) throw ApiError.internal('Wallet customer tidak ditemukan');
+
+            const row = data as any;
+            const { newBalance, tx, result } = compute(Number(row.balance ?? 0));
+
+            let q: any = supabaseAdmin
+                .from('wallets')
+                .update({ balance: newBalance, updated_at: new Date().toISOString() })
+                .eq('user_id', userId);
+            q = row.updated_at == null ? q.is('updated_at', null) : q.eq('updated_at', row.updated_at);
+
+            const { data: updated, error: uErr } = await q.select('user_id');
+            if (uErr) {
+                logger.error('Update wallet customer gagal', { error: uErr, userId });
+                throw ApiError.internal('Gagal update wallet customer');
+            }
+            if (!updated || updated.length === 0) continue;
+
+            if (tx) {
+                const { error: tErr } = await supabaseAdmin
+                    .from('wallet_transactions')
+                    .insert({ user_id: userId, ...tx, balance_after: newBalance });
+                if (tErr) {
+                    logger.error('Insert wallet_transactions gagal', { error: tErr, userId });
+                }
+            }
+            return result;
+        }
+        throw ApiError.internal('Wallet sedang sibuk, coba lagi');
+    }
+
+    // Saldo (balance) sesuai jenis dompet
+    private async getBalanceByType(walletType: WalletType, userId: string): Promise<number> {
+        if (walletType === 'driver') return (await this.getWallet(userId, 'driver')).balance;
+        if (walletType === 'merchant') return (await merchantWalletService.getWallet(userId)).balance;
+        return (await this.getWallet(userId, 'customer')).balance;
+    }
+
+    // ============================================================
+    // TOPUP SUKSES — kreditkan ke dompet sesuai topup.wallet_type
+    // Dipanggil dari wallet.callback (handleTopupCallback).
+    // ============================================================
+    async creditTopup(
+        topup: any,
+        extra?: { va_code?: string; serialnumber?: string }
+    ) {
+        const walletType: WalletType = (topup.wallet_type as WalletType) ?? 'customer';
+        const userId: string = topup.user_id;
+
+        const nominal = Number(topup.nominal ?? topup.amount);
+        const adminFee = Number(topup.admin_fee ?? 0);
+        const totalBayar = Number(topup.amount);
+        const netAmount = nominal; // yang masuk saldo = nominal (fee tidak ikut)
+
+        const methodLabel = topup.method?.toUpperCase() ?? 'LinkQu';
+        const description =
+            `Topup via ${methodLabel} (nominal Rp${nominal.toLocaleString('id-ID')} ` +
+            `+ fee Rp${adminFee.toLocaleString('id-ID')})`;
+
+        // ── MERCHANT ──
+        if (walletType === 'merchant') {
+            return merchantWalletService.creditTopup(userId, netAmount, {
+                partnerReff: topup.partner_reff,
+                method: topup.method,
+                nominal,
+                adminFee,
+                totalBayar,
+                vaCode: extra?.va_code,
+                serialnumber: extra?.serialnumber,
+            });
+        }
+
+        // ── DRIVER: lunasi utang cash dulu, sisanya ke saldo ──
+        if (walletType === 'driver') {
+            return this.mutateDriver(userId, null, (w) => {
+                const balance = Number(w.balance ?? 0);
+                const debt = Number(w.cash_debt ?? 0);
+                const debtPaid = Math.min(debt, netAmount);
+                const newDebt = debt - debtPaid;
+                const newBalance = balance + netAmount - debtPaid;
+
+                const ledger: DriverLedgerDraft[] = [
+                    {
+                        entry_type: 'topup',
+                        amount: netAmount,
+                        direction: 'in',
+                        balance_after: balance + netAmount, // kredit penuh
+                        cash_debt_after: debt,
+                        description,
+                        metadata: {
+                            partner_reff: topup.partner_reff,
+                            va_code: extra?.va_code,
+                            serialnumber: extra?.serialnumber,
+                            total_bayar: totalBayar,
+                            nominal,
+                            admin_fee: adminFee,
+                            net_amount: netAmount,
+                            debt_paid: debtPaid,
+                        },
+                    },
+                ];
+                if (debtPaid > 0) {
+                    ledger.push({
+                        entry_type: 'debt_payment',
+                        amount: debtPaid,
+                        direction: 'out',
+                        balance_after: newBalance,
+                        cash_debt_after: newDebt,
+                        description: 'Pelunasan utang cash dari topup',
+                        metadata: {
+                            debt_paid: debtPaid,
+                            source: 'topup',
+                            partner_reff: topup.partner_reff,
+                        },
+                    });
+                }
+
+                return {
+                    patch: {
+                        balance: newBalance,
+                        cash_debt: newDebt,
+                        total_commission_owed: newDebt,
+                        total_commission_paid: Number(w.total_commission_paid ?? 0) + debtPaid,
+                    },
+                    ledger,
+                    result: { newBalance, newCashDebt: newDebt, debtPaid },
+                };
+            });
+        }
+
+        // ── CUSTOMER ──
+        return this.mutateCustomer(userId, (balance) => {
+            const newBalance = balance + netAmount;
+            return {
+                newBalance,
+                tx: {
+                    type: 'topup',
+                    amount: netAmount,
+                    reference_id: topup.partner_reff,
+                    description,
+                },
+                result: { newBalance, newCashDebt: 0, debtPaid: 0 },
+            };
+        });
+    }
+
+    // ============================================================
+    // WITHDRAW — potong saldo (nominal + fee) dengan GUARD saldo.
+    // Guard ada di dalam compute (di bawah lock), jadi dua execute
+    // bersamaan tidak bisa membuat saldo negatif.
+    // ============================================================
+    private async debitWithdraw(
+        walletType: WalletType,
+        userId: string,
+        info: {
+            nominal: number;
+            feeAdmin: number;
+            totalDeduction: number;
+            bankCode: string;
+            accountNumber: string;
+            partnerReff: string;
+        }
+    ) {
+        const insufficient = (balance: number) =>
+            ApiError.badRequest(
+                `Saldo tidak cukup. Butuh Rp${info.totalDeduction.toLocaleString('id-ID')} ` +
+                `(nominal Rp${info.nominal.toLocaleString('id-ID')} + fee Rp${info.feeAdmin.toLocaleString('id-ID')}). ` +
+                `Saldo: Rp${balance.toLocaleString('id-ID')}`
+            );
+        const description =
+            `Withdraw Rp${info.nominal.toLocaleString('id-ID')} ke ${info.bankCode} ` +
+            `${info.accountNumber} + fee Rp${info.feeAdmin.toLocaleString('id-ID')}`;
+
+        if (walletType === 'merchant') {
+            // Pre-check di sini; guard di dalam compute ada di merchantWalletService.debitWithdraw
+            const mw = await merchantWalletService.getWallet(userId);
+            if (mw.balance < info.totalDeduction) throw insufficient(mw.balance);
+            return merchantWalletService.debitWithdraw(userId, info);
+        }
+
+        if (walletType === 'driver') {
+            return this.mutateDriver(userId, null, (w) => {
+                const balance = Number(w.balance ?? 0);
+                if (balance < info.totalDeduction) throw insufficient(balance);
+                const newBalance = balance - info.totalDeduction;
+                return {
+                    patch: { balance: newBalance },
+                    ledger: [
+                        {
+                            entry_type: 'withdraw',
+                            amount: info.totalDeduction,
+                            direction: 'out',
+                            balance_after: newBalance,
+                            cash_debt_after: Number(w.cash_debt ?? 0),
+                            description,
+                            metadata: {
+                                partner_reff: info.partnerReff,
+                                nominal: info.nominal,
+                                fee_admin: info.feeAdmin,
+                                total_deduction: info.totalDeduction,
+                            },
+                        },
+                    ],
+                    result: { newBalance },
+                };
+            });
+        }
+
+        return this.mutateCustomer(userId, (balance) => {
+            if (balance < info.totalDeduction) throw insufficient(balance);
+            const newBalance = balance - info.totalDeduction;
+            return {
+                newBalance,
+                tx: {
+                    type: 'withdraw',
+                    amount: info.totalDeduction,
+                    reference_id: info.partnerReff,
+                    description,
+                },
+                result: { newBalance },
+            };
+        });
+    }
+
+    // ============================================================
+    // WITHDRAW GAGAL — kembalikan saldo ke dompet yang SAMA dengan
+    // saat dipotong (wd.wallet_type). Aman dipanggil berkali-kali:
+    // kolom wallet_withdrawals.refunded_at diklaim secara atomik.
+    //
+    // Panggil dari handleWithdrawCallback (status FAILED) dan dari
+    // withdrawExecute (kalau LinkQu menolak langsung).
+    // ============================================================
+    async refundWithdrawal(wd: any): Promise<{ refunded: boolean }> {
+        const walletType: WalletType = (wd.wallet_type as WalletType) ?? 'customer';
+        const userId: string = wd.user_id;
+        const nominal = Number(wd.amount);
+        const feeAdmin = Number(wd.fee_admin ?? 0);
+        const totalRefund = nominal + feeAdmin;
+
+        // Klaim atomik — hanya satu proses yang boleh refund
+        const { data: claimed, error: cErr } = await supabaseAdmin
+            .from('wallet_withdrawals')
+            .update({ refunded_at: new Date().toISOString() })
+            .eq('id', wd.id)
+            .is('refunded_at', null)
+            .select('id');
+        if (cErr) throw ApiError.internal(`Klaim refund gagal: ${cErr.message}`);
+        if (!claimed || claimed.length === 0) {
+            logger.info('ℹ️ Withdraw sudah direfund, skip', { inquiry_reff: wd.inquiry_reff });
+            return { refunded: false };
+        }
+
+        const description =
+            `Refund withdraw gagal #${wd.inquiry_reff} ` +
+            `(nominal Rp${nominal.toLocaleString('id-ID')} + fee Rp${feeAdmin.toLocaleString('id-ID')})`;
+
+        try {
+            if (walletType === 'merchant') {
+                await merchantWalletService.refundWithdraw(userId, {
+                    inquiryReff: wd.inquiry_reff,
+                    nominal,
+                    feeAdmin,
+                    totalRefund,
+                });
+            } else if (walletType === 'driver') {
+                await this.mutateDriver(userId, null, (w) => {
+                    const newBalance = Number(w.balance ?? 0) + totalRefund;
+                    return {
+                        patch: { balance: newBalance },
+                        ledger: [
+                            {
+                                entry_type: 'adjustment',
+                                amount: totalRefund,
+                                direction: 'in',
+                                balance_after: newBalance,
+                                cash_debt_after: Number(w.cash_debt ?? 0),
+                                description,
+                                metadata: {
+                                    inquiry_reff: wd.inquiry_reff,
+                                    nominal,
+                                    fee_admin: feeAdmin,
+                                    total_refund: totalRefund,
+                                },
+                            },
+                        ],
+                        result: { newBalance },
+                    };
+                });
+            } else {
+                await this.mutateCustomer(userId, (balance) => {
+                    const newBalance = balance + totalRefund;
+                    return {
+                        newBalance,
+                        tx: {
+                            type: 'refund',
+                            amount: totalRefund,
+                            reference_id: wd.inquiry_reff,
+                            description,
+                        },
+                        result: { newBalance },
+                    };
+                });
+            }
+        } catch (err: any) {
+            // Saldo belum kembali -> lepas klaim supaya callback berikutnya bisa mencoba lagi
+            await supabaseAdmin
+                .from('wallet_withdrawals')
+                .update({ refunded_at: null })
+                .eq('id', wd.id);
+            logger.error('Refund withdraw gagal, klaim dilepas', {
+                inquiry_reff: wd.inquiry_reff,
+                error: err?.message ?? err,
+            });
+            throw err;
+        }
+
+        logger.info('✅ Withdraw direfund', {
+            inquiry_reff: wd.inquiry_reff,
+            walletType,
+            userId,
+            totalRefund,
+        });
+        return { refunded: true };
+    }
+
+    // ============================================================
+    // SETTLE ORDER — FINAL v2
+    //
+    // Perbaikan dari versi sebelumnya:
+    //  1. Klaim ATOMIK (settled_at diisi lebih dulu dengan kondisi
+    //     `settled_at IS NULL`). Dua panggilan bersamaan tidak lagi
+    //     membayar driver dua kali.
+    //  2. Update wallet pakai optimistic lock (mutateDriver), jadi tidak
+    //     menimpa topup/withdraw yang masuk di waktu yang sama.
+    //  3. Kalau update wallet gagal, klaim dilepas -> bisa diulang
+    //     (dulu: wallet bisa sudah berubah tapi order belum ditandai).
+    //  4. Ledger 'debt_payment dari saldo' memakai balance_after yang benar
+    //     (sebelumnya newBalance + balanceCredit, seharusnya dikurangi).
+    //  5. total_commission_paid ikut bertambah saat utang cash dilunasi
+    //     dari order gateway (sebelumnya hanya komisi order itu sendiri).
+    //  6. Order CASH: komisi dipotong dari SALDO dulu, sisanya baru jadi utang.
+    //  7. Komisi toko (food) ikut diproses lewat merchantWalletService
+    //     (idempotent, tidak pernah throw).
     // ============================================================
     async settleOrder(orderId: number) {
         // ────────────────────────────────────────────────────────
-        // 1. Ambil order dari DB
+        // 1. Ambil order
         // ────────────────────────────────────────────────────────
         const { data: orderRaw, error: oErr } = await supabaseAdmin
             .from('orders')
@@ -207,7 +657,7 @@ class WalletService {
         const order = orderRaw as unknown as OrderRow;
 
         // ────────────────────────────────────────────────────────
-        // 2. Validasi status
+        // 2. Validasi
         // ────────────────────────────────────────────────────────
         if (order.status !== 'completed') {
             throw ApiError.badRequest('Order belum completed');
@@ -221,22 +671,18 @@ class WalletService {
         }
 
         // ────────────────────────────────────────────────────────
-        // 3. Hitung komisi & driver earning
-        //    ✅ FOOD: dasar komisi = delivery_fee (jasa antar driver).
-        //    Harga makanan (subtotal + packaging) bukan penghasilan driver,
-        //    jadi tidak boleh dipotong komisi.
-        //    ride / send: tetap total_fare.
+        // 3. Hitung komisi & earning
+        //    food / jastip: dasar komisi = delivery_fee (ongkir saja)
+        //    ride / send  : total_fare
         // ────────────────────────────────────────────────────────
+        const driverId = order.driver_id;
         const isFood = order.type === 'food';
         const isJastip = order.type === 'jastip';
 
-        const commissionRate = await this.getCommissionRate(
-            order.type,
-            order.tariff_code
-        );
+        const commissionRate = await this.getCommissionRate(order.type, order.tariff_code);
 
         const commissionBase = isFood || isJastip
-            ? Number(order.delivery_fee) || 0                    // ✅ FOOD / JASTIP (hanya ongkir)
+            ? Number(order.delivery_fee) || 0
             : Number(order.total_fare) || 0;
         const commissionAmount = Math.round(commissionBase * commissionRate);
         const driverEarning = commissionBase - commissionAmount;
@@ -244,31 +690,6 @@ class WalletService {
         const isCash = order.payment_method === 'cash';
         const settlementType = isCash ? 'cash' : 'gateway';
 
-        // ────────────────────────────────────────────────────────
-        // 4. Pastikan wallet ada
-        // ────────────────────────────────────────────────────────
-        await supabaseAdmin
-            .from('driver_wallets')
-            .upsert(
-                { driver_id: order.driver_id },
-                { onConflict: 'driver_id', ignoreDuplicates: true }
-            );
-
-        const { data: walletRaw, error: wErr } = await supabaseAdmin
-            .from('driver_wallets')
-            .select('*')
-            .eq('driver_id', order.driver_id)
-            .single();
-
-        if (wErr || !walletRaw) throw ApiError.internal('Wallet tidak ditemukan');
-
-        const wallet = walletRaw as unknown as WalletRow;
-
-        let newBalance = Number(wallet.balance);
-        let newCashDebt = Number(wallet.cash_debt);
-        const ledgerEntries: any[] = [];
-
-        // metadata tambahan khusus food (untuk audit)
         const foodMeta = isFood
             ? {
                 order_type: 'food',
@@ -280,246 +701,247 @@ class WalletService {
             : { order_type: order.type };
 
         // ────────────────────────────────────────────────────────
-        // 5. Bangun ledger entries berdasarkan metode pembayaran
+        // 4. KLAIM ATOMIK — hanya satu proses yang boleh lanjut
         // ────────────────────────────────────────────────────────
-        if (isCash) {
-            // ══════════════════════════════════════════════════════
-            // ── CASH ──
-            // Komisi jadi UTANG driver ke platform. Balance tidak berubah.
-            // ══════════════════════════════════════════════════════
-            newCashDebt = newCashDebt + commissionAmount;
-
-            ledgerEntries.push({
-                driver_id: order.driver_id,
-                order_id: order.id,
-                entry_type: 'earning_cash',
-                amount: driverEarning,
-                direction: 'in',
-                balance_after: newBalance,
-                cash_debt_after: newCashDebt,
-                description: `Pendapatan cash order #${order.id}`,
-                metadata: {
-                    payment_method: 'cash',
-                    commission_base: commissionBase,
-                    driver_earning: driverEarning,
-                    ...foodMeta,
-                },
-            });
-
-            ledgerEntries.push({
-                driver_id: order.driver_id,
-                order_id: order.id,
-                entry_type: 'commission_cash',
-                amount: commissionAmount,
-                direction: 'out',
-                balance_after: newBalance,
-                cash_debt_after: newCashDebt,
-                description: `Komisi cash order #${order.id} (${(commissionRate * 100).toFixed(1)}%)`,
-                metadata: {
-                    commission_rate: commissionRate,
-                    commission_base: commissionBase,
-                    commission_amount: commissionAmount,
-                    ...foodMeta,
-                },
-            });
-        } else {
-            // ══════════════════════════════════════════════════════
-            // ── GATEWAY (qris / va / wallet) ──
-            // ✅ FIXED: Lunasi utang cash pakai SALDO AKTIF dulu,
-            //    baru pakai EARNING order ini. Sisanya masuk saldo.
-            //
-            // Alur:
-            // 1. Cek saldo aktif → pakai untuk lunasi utang (jika ada)
-            // 2. Jika masih ada utang → pakai earning order
-            // 3. Sisa earning → masuk saldo aktif
-            // ══════════════════════════════════════════════════════
-            const netEarning = driverEarning;
-
-            let debtPaidFromBalance = 0;
-            let debtPaidFromEarning = 0;
-
-            if (newCashDebt > 0) {
-                // 1️⃣ Coba lunasi dari SALDO AKTIF dulu
-                if (newBalance > 0) {
-                    debtPaidFromBalance = Math.min(newCashDebt, newBalance);
-                    newBalance -= debtPaidFromBalance;
-                    newCashDebt -= debtPaidFromBalance;
-                }
-
-                // 2️⃣ Kalau masih ada utang, lunasi dari EARNING order ini
-                if (newCashDebt > 0) {
-                    debtPaidFromEarning = Math.min(newCashDebt, netEarning);
-                    newCashDebt -= debtPaidFromEarning;
-                }
-            }
-
-            // 3️⃣ Sisa earning setelah pelunasan → masuk saldo
-            const balanceCredit = netEarning - debtPaidFromEarning;
-            newBalance += balanceCredit;
-
-            const totalDebtPaid = debtPaidFromBalance + debtPaidFromEarning;
-
-            // ── Ledger: earning gateway ──
-            ledgerEntries.push({
-                driver_id: order.driver_id,
-                order_id: order.id,
-                entry_type: 'earning_gateway',
-                amount: netEarning,
-                direction: 'in',
-                balance_after: newBalance,
-                cash_debt_after: newCashDebt,
-                description: `Pendapatan order #${order.id} (net setelah komisi)`,
-                metadata: {
-                    payment_method: order.payment_method,
-                    commission_base: commissionBase,
-                    commission_amount: commissionAmount,
-                    net_earning: netEarning,
-                    debt_paid_from_balance: debtPaidFromBalance,
-                    debt_paid_from_earning: debtPaidFromEarning,
-                    ...foodMeta,
-                },
-            });
-
-            // ── Ledger: pelunasan utang dari saldo aktif ──
-            if (debtPaidFromBalance > 0) {
-                ledgerEntries.push({
-                    driver_id: order.driver_id,
-                    order_id: order.id,
-                    entry_type: 'debt_payment',
-                    amount: debtPaidFromBalance,
-                    direction: 'out',
-                    balance_after: newBalance + balanceCredit, // sebelum kredit earning
-                    cash_debt_after: newCashDebt + debtPaidFromEarning,
-                    description: `Pelunasan utang cash dari saldo aktif`,
-                    metadata: {
-                        source: 'balance',
-                        debt_paid: debtPaidFromBalance,
-                    },
-                });
-            }
-
-            // ── Ledger: pelunasan utang dari earning order ──
-            if (debtPaidFromEarning > 0) {
-                ledgerEntries.push({
-                    driver_id: order.driver_id,
-                    order_id: order.id,
-                    entry_type: 'debt_payment',
-                    amount: debtPaidFromEarning,
-                    direction: 'out',
-                    balance_after: newBalance,
-                    cash_debt_after: newCashDebt,
-                    description: `Pelunasan utang cash dari pendapatan order`,
-                    metadata: {
-                        source: 'earning',
-                        debt_paid: debtPaidFromEarning,
-                    },
-                });
-            }
-
-            // ── Log untuk audit ──
-            if (totalDebtPaid > 0) {
-                logger.info('Auto-lunasi utang cash saat order gateway', {
-                    orderId: order.id,
-                    driverId: order.driver_id,
-                    debtPaidFromBalance,
-                    debtPaidFromEarning,
-                    totalDebtPaid,
-                    remainingDebt: newCashDebt,
-                    newBalance,
-                });
-            }
-        }
-
-        // ────────────────────────────────────────────────────────
-        // 5b. ✅ JASTIP: ganti uang talangan belanja driver.
-        //     Bukan pendapatan → tanpa komisi, tidak ikut total_earning,
-        //     dan tidak dipakai melunasi utang cash (itu uang driver sendiri).
-        //     Jastip selalu prabayar (non-cash).
-        // ────────────────────────────────────────────────────────
-        let jastipReimbursement = 0;
-        if (isJastip && !isCash) {
-            jastipReimbursement = Math.round(Number(order.actual_item_total) || 0);
-            if (jastipReimbursement > 0) {
-                newBalance += jastipReimbursement;
-                ledgerEntries.push({
-                    driver_id: order.driver_id,
-                    order_id: order.id,
-                    entry_type: 'jastip_reimbursement',
-                    amount: jastipReimbursement,
-                    direction: 'in',
-                    balance_after: newBalance,
-                    cash_debt_after: newCashDebt,
-                    description: `Ganti uang belanja jastip order #${order.id}`,
-                    metadata: {
-                        order_type: 'jastip',
-                        actual_item_total: jastipReimbursement,
-                    },
-                });
-            }
-        }
-        // Jastip tunai: driver sudah menerima uang belanja langsung dari customer,
-        // jadi tidak ada penggantian lewat wallet. Komisi (dari ongkir) mengikuti jalur cash.
-
-        // ────────────────────────────────────────────────────────
-        // 6. Update wallet
-        // ────────────────────────────────────────────────────────
-        const { error: walletErr } = await supabaseAdmin
-            .from('driver_wallets')
-            .update({
-                balance: newBalance,
-                cash_debt: newCashDebt,
-                total_earning: Number(wallet.total_earning) + driverEarning,
-                total_commission_paid:
-                    Number(wallet.total_commission_paid) +
-                    (isCash ? 0 : commissionAmount),
-                total_commission_owed: newCashDebt,
-            })
-            .eq('driver_id', order.driver_id);
-
-        if (walletErr) {
-            logger.error('Update wallet gagal', { error: walletErr, orderId });
-            throw ApiError.internal('Gagal update wallet');
-        }
-
-        // ────────────────────────────────────────────────────────
-        // 7. Insert ledger entries
-        // ────────────────────────────────────────────────────────
-        const { error: ledgerErr } = await supabaseAdmin
-            .from('driver_wallet_ledger')
-            .insert(ledgerEntries);
-
-        if (ledgerErr) {
-            logger.error('Insert ledger gagal', { error: ledgerErr, orderId });
-        }
-
-        // ────────────────────────────────────────────────────────
-        // 8. Update order
-        //    ✅ payment_status order cash → 'paid' setelah selesai
-        // ────────────────────────────────────────────────────────
-        await supabaseAdmin
+        const { data: claimed, error: claimErr } = await supabaseAdmin
             .from('orders')
             .update({
+                settled_at: new Date().toISOString(),
+                settlement_type: settlementType,
                 commission_rate: commissionRate,
                 commission_amount: commissionAmount,
                 platform_earning: commissionAmount,
                 driver_earning: driverEarning,
-                settled_at: new Date().toISOString(),
-                settlement_type: settlementType,
-                ...(isCash ? { payment_status: 'paid' } : {}),
             })
-            .eq('id', order.id);
+            .eq('id', order.id)
+            .eq('status', 'completed')
+            .is('settled_at', null)
+            .select('id');
+
+        if (claimErr) {
+            logger.error('Klaim settlement gagal', { error: claimErr, orderId });
+            throw ApiError.internal('Gagal klaim settlement');
+        }
+        if (!claimed || claimed.length === 0) {
+            logger.info('Order sudah di-settle proses lain, skip', { orderId });
+            return { already_settled: true };
+        }
+
+        // ────────────────────────────────────────────────────────
+        // 5. Update wallet driver (optimistic lock). compute() murni.
+        // ────────────────────────────────────────────────────────
+        let result: {
+            newBalance: number;
+            newCashDebt: number;
+            jastipReimbursement: number;
+            totalDebtPaid: number;
+        };
+
+        try {
+            result = await this.mutateDriver(driverId, order.id, (w) => {
+                let newBalance = Number(w.balance);
+                let newCashDebt = Number(w.cash_debt);
+                const ledger: DriverLedgerDraft[] = [];
+                let totalDebtPaid = 0;
+
+                let cashFromBalance = 0;
+                let cashToDebt = 0;
+
+                if (isCash) {
+                    // ── CASH: uang order sudah di tangan driver. Komisi ditagih:
+                    //    potong SALDO dulu, kekurangannya baru jadi UTANG.
+                    const debtBefore = newCashDebt;
+                    cashFromBalance = Math.min(Math.max(newBalance, 0), commissionAmount);
+                    cashToDebt = commissionAmount - cashFromBalance;
+                    newBalance -= cashFromBalance;
+                    newCashDebt += cashToDebt;
+
+                    ledger.push({
+                        entry_type: 'earning_cash',
+                        amount: driverEarning,
+                        direction: 'in',
+                        balance_after: Number(w.balance),
+                        cash_debt_after: debtBefore,
+                        description: `Pendapatan cash order #${order.id}`,
+                        metadata: {
+                            payment_method: 'cash',
+                            commission_base: commissionBase,
+                            driver_earning: driverEarning,
+                            ...foodMeta,
+                        },
+                    });
+                    ledger.push({
+                        entry_type: 'commission_cash',
+                        amount: commissionAmount,
+                        direction: 'out',
+                        balance_after: newBalance,
+                        cash_debt_after: newCashDebt,
+                        description: `Komisi cash order #${order.id} (${(commissionRate * 100).toFixed(1)}%)`,
+                        metadata: {
+                            commission_rate: commissionRate,
+                            commission_base: commissionBase,
+                            commission_amount: commissionAmount,
+                            from_balance: cashFromBalance,
+                            to_debt: cashToDebt,
+                            ...foodMeta,
+                        },
+                    });
+                } else {
+                    // ── GATEWAY: lunasi utang cash dari SALDO AKTIF dulu,
+                    //    lalu dari EARNING order ini, sisanya masuk saldo.
+                    const netEarning = driverEarning;
+                    let debtPaidFromBalance = 0;
+                    let debtPaidFromEarning = 0;
+
+                    if (newCashDebt > 0) {
+                        if (newBalance > 0) {
+                            debtPaidFromBalance = Math.min(newCashDebt, newBalance);
+                            newBalance -= debtPaidFromBalance;
+                            newCashDebt -= debtPaidFromBalance;
+                        }
+                        if (newCashDebt > 0) {
+                            debtPaidFromEarning = Math.min(newCashDebt, netEarning);
+                            newCashDebt -= debtPaidFromEarning;
+                        }
+                    }
+
+                    const balanceCredit = netEarning - debtPaidFromEarning;
+                    newBalance += balanceCredit;
+                    totalDebtPaid = debtPaidFromBalance + debtPaidFromEarning;
+
+                    ledger.push({
+                        entry_type: 'earning_gateway',
+                        amount: netEarning,
+                        direction: 'in',
+                        balance_after: newBalance,
+                        cash_debt_after: newCashDebt,
+                        description: `Pendapatan order #${order.id} (net setelah komisi)`,
+                        metadata: {
+                            payment_method: order.payment_method,
+                            commission_base: commissionBase,
+                            commission_amount: commissionAmount,
+                            net_earning: netEarning,
+                            debt_paid_from_balance: debtPaidFromBalance,
+                            debt_paid_from_earning: debtPaidFromEarning,
+                            ...foodMeta,
+                        },
+                    });
+
+                    if (debtPaidFromBalance > 0) {
+                        ledger.push({
+                            entry_type: 'debt_payment',
+                            amount: debtPaidFromBalance,
+                            direction: 'out',
+                            // ✅ FIX: saldo SEBELUM kredit earning = newBalance - balanceCredit
+                            balance_after: newBalance - balanceCredit,
+                            cash_debt_after: newCashDebt + debtPaidFromEarning,
+                            description: 'Pelunasan utang cash dari saldo aktif',
+                            metadata: { source: 'balance', debt_paid: debtPaidFromBalance },
+                        });
+                    }
+                    if (debtPaidFromEarning > 0) {
+                        ledger.push({
+                            entry_type: 'debt_payment',
+                            amount: debtPaidFromEarning,
+                            direction: 'out',
+                            balance_after: newBalance,
+                            cash_debt_after: newCashDebt,
+                            description: 'Pelunasan utang cash dari pendapatan order',
+                            metadata: { source: 'earning', debt_paid: debtPaidFromEarning },
+                        });
+                    }
+                }
+
+                // ── JASTIP (non-cash): ganti uang talangan belanja driver.
+                //    Bukan pendapatan: tanpa komisi, tidak ikut total_earning,
+                //    tidak dipakai melunasi utang cash.
+                let jastipReimbursement = 0;
+                if (isJastip && !isCash) {
+                    jastipReimbursement = Math.round(Number(order.actual_item_total) || 0);
+                    if (jastipReimbursement > 0) {
+                        newBalance += jastipReimbursement;
+                        ledger.push({
+                            entry_type: 'jastip_reimbursement',
+                            amount: jastipReimbursement,
+                            direction: 'in',
+                            balance_after: newBalance,
+                            cash_debt_after: newCashDebt,
+                            description: `Ganti uang belanja jastip order #${order.id}`,
+                            metadata: {
+                                order_type: 'jastip',
+                                actual_item_total: jastipReimbursement,
+                            },
+                        });
+                    }
+                }
+
+                return {
+                    patch: {
+                        balance: newBalance,
+                        cash_debt: newCashDebt,
+                        total_earning: Number(w.total_earning) + driverEarning,
+                        // ✅ komisi order ini (gateway) + utang lama yang lunas sekarang
+                        total_commission_paid:
+                            Number(w.total_commission_paid) +
+                            (isCash ? cashFromBalance : commissionAmount) +
+                            totalDebtPaid,
+                        total_commission_owed: newCashDebt,
+                    },
+                    ledger,
+                    result: { newBalance, newCashDebt, jastipReimbursement, totalDebtPaid },
+                };
+            });
+        } catch (err: any) {
+            // Wallet belum berubah -> lepas klaim supaya settlement bisa diulang
+            await supabaseAdmin
+                .from('orders')
+                .update({ settled_at: null, settlement_type: null })
+                .eq('id', order.id);
+            logger.error('Settle gagal, klaim dilepas', {
+                orderId,
+                error: err?.message ?? err,
+            });
+            throw err;
+        }
+
+        // ────────────────────────────────────────────────────────
+        // 6. Order cash -> payment_status 'paid' (best-effort)
+        // ────────────────────────────────────────────────────────
+        if (isCash) {
+            const { error: pErr } = await supabaseAdmin
+                .from('orders')
+                .update({ payment_status: 'paid' })
+                .eq('id', order.id);
+            if (pErr) logger.error('Update payment_status gagal', { orderId, error: pErr });
+        }
+
+        if (result.totalDebtPaid > 0) {
+            logger.info('Auto-lunasi utang cash saat order gateway', {
+                orderId: order.id,
+                driverId,
+                totalDebtPaid: result.totalDebtPaid,
+                remainingDebt: result.newCashDebt,
+            });
+        }
+
+        // ────────────────────────────────────────────────────────
+        // 7. Komisi toko untuk order FOOD (idempotent, tidak pernah throw)
+        // ────────────────────────────────────────────────────────
+        if (isFood) {
+            await merchantWalletService.settleOrder(order.id);
+        }
 
         logger.info('Order settled', {
             orderId: order.id,
             orderType: order.type,
-            driverId: order.driver_id,
+            driverId,
             settlementType,
             commissionBase,
             commissionRate,
             commissionAmount,
             driverEarning,
-            newBalance,
-            newCashDebt,
+            newBalance: result.newBalance,
+            newCashDebt: result.newCashDebt,
         });
 
         return {
@@ -528,9 +950,9 @@ class WalletService {
             commission_rate: commissionRate,
             commission_amount: commissionAmount,
             driver_earning: driverEarning,
-            new_balance: newBalance,
-            new_cash_debt: newCashDebt,
-            jastip_reimbursement: jastipReimbursement,
+            new_balance: result.newBalance,
+            new_cash_debt: result.newCashDebt,
+            jastip_reimbursement: result.jastipReimbursement,
         };
     }
     // ============================================================
@@ -562,6 +984,8 @@ class WalletService {
 
     // ============================================================
     // REQUEST PAYOUT (driver only)
+    // Saldo dipotong di bawah lock + guard, jadi request ganda
+    // tidak bisa membuat saldo negatif.
     // ============================================================
     async requestPayout(
         driverId: string,
@@ -569,20 +993,6 @@ class WalletService {
         bankInfo: { bank_code: string; bank_name: string; account_number: string; account_name: string; }
     ) {
         if (amount <= 0) throw ApiError.badRequest('Jumlah harus > 0');
-
-        const wallet = await this.getWallet(driverId, 'driver');
-
-        if (wallet.balance < amount) {
-            throw ApiError.badRequest(
-                `Saldo tidak cukup. Saldo tersedia: Rp${wallet.balance.toLocaleString('id-ID')}`
-            );
-        }
-
-        if (wallet.cash_debt > 0) {
-            throw ApiError.badRequest(
-                `Lunasi utang cash dulu (Rp${wallet.cash_debt.toLocaleString('id-ID')})`
-            );
-        }
 
         const MIN_PAYOUT = 50000;
         if (amount < MIN_PAYOUT) {
@@ -598,23 +1008,45 @@ class WalletService {
         if (pErr || !payoutRaw) throw ApiError.internal('Gagal buat payout');
 
         const payout = payoutRaw as any;
-        const newBalance = wallet.balance - amount;
 
-        await supabaseAdmin
-            .from('driver_wallets')
-            .update({ balance: newBalance })
-            .eq('driver_id', driverId);
+        try {
+            await this.mutateDriver(driverId, null, (w) => {
+                const balance = Number(w.balance);
+                const debt = Number(w.cash_debt);
 
-        await supabaseAdmin.from('driver_wallet_ledger').insert({
-            driver_id: driverId,
-            entry_type: 'payout',
-            amount,
-            direction: 'out',
-            balance_after: newBalance,
-            cash_debt_after: wallet.cash_debt,
-            description: `Request payout #${payout.id}`,
-            metadata: { payout_id: payout.id, ...bankInfo },
-        });
+                if (balance < amount) {
+                    throw ApiError.badRequest(
+                        `Saldo tidak cukup. Saldo tersedia: Rp${balance.toLocaleString('id-ID')}`
+                    );
+                }
+                if (debt > 0) {
+                    throw ApiError.badRequest(
+                        `Lunasi utang cash dulu (Rp${debt.toLocaleString('id-ID')})`
+                    );
+                }
+
+                const newBalance = balance - amount;
+                return {
+                    patch: { balance: newBalance },
+                    ledger: [
+                        {
+                            entry_type: 'payout',
+                            amount,
+                            direction: 'out',
+                            balance_after: newBalance,
+                            cash_debt_after: debt,
+                            description: `Request payout #${payout.id}`,
+                            metadata: { payout_id: payout.id, ...bankInfo },
+                        },
+                    ],
+                    result: { newBalance },
+                };
+            });
+        } catch (err) {
+            // Saldo tidak terpotong -> batalkan baris payout
+            await supabaseAdmin.from('payouts').delete().eq('id', payout.id);
+            throw err;
+        }
 
         logger.info('Payout requested', { payoutId: payout.id, driverId, amount });
 
@@ -670,6 +1102,7 @@ class WalletService {
         amount: number;
         method: 'va' | 'qris';
         bank_code?: string;
+        walletType?: WalletType;   // ✅ dompet tujuan (dari role akun, bukan body)
     }) {
         console.log('🚀 [topupInquiry] START', { userId, dto });
 
@@ -802,6 +1235,7 @@ class WalletService {
                 .from('wallet_topups')
                 .insert({
                     user_id: userId,
+                    wallet_type: dto.walletType ?? 'customer',   // ✅ dompet tujuan
                     partner_reff: partnerReff,
                     method: dto.method,
                     amount: totalAmount,          // Rp12.500 (total bayar)
@@ -961,17 +1395,17 @@ class WalletService {
 
     // ============================================================
     // WITHDRAW — INQUIRY
+    // Dompet ditentukan controller dari role akun (walletType),
+    // lalu DISIMPAN di baris wallet_withdrawals.wallet_type.
     // ============================================================
     async withdrawInquiry(userId: string, dto: {
         amount: number;
         bank_code: string;
         account_number: string;
-        role?: 'driver' | 'customer';
+        walletType: WalletType;
     }) {
-        const role = dto.role ?? 'driver';
-        const wallet = role === 'driver'
-            ? await this.getWallet(userId, 'driver')
-            : await this.getWallet(userId, 'customer');
+        const walletType: WalletType = dto.walletType;
+        const balance = await this.getBalanceByType(walletType, userId);
 
         // ═══════════════════════════════════════════════════════════
         // ✅ HITUNG FEE ADMIN WITHDRAW
@@ -979,12 +1413,12 @@ class WalletService {
         const WITHDRAW_FEE = 3000;
         const totalDeduction = dto.amount + WITHDRAW_FEE;
 
-        // Cek saldo terhadap TOTAL (nominal + fee)
-        if (wallet.balance < totalDeduction) {
+        // Cek saldo terhadap TOTAL (nominal + fee). Dicek ULANG saat execute.
+        if (balance < totalDeduction) {
             throw ApiError.badRequest(
                 `Saldo tidak cukup. Butuh Rp${totalDeduction.toLocaleString('id-ID')} ` +
                 `(nominal Rp${dto.amount.toLocaleString('id-ID')} + fee Rp${WITHDRAW_FEE.toLocaleString('id-ID')}). ` +
-                `Saldo: Rp${wallet.balance.toLocaleString('id-ID')}`
+                `Saldo: Rp${balance.toLocaleString('id-ID')}`
             );
         }
 
@@ -1011,9 +1445,9 @@ class WalletService {
             method = 'POST';
         }
 
-        // ✅ Signature pakai nominal yang ditransfer (bukan total)
+        // Signature pakai nominal yang ditransfer (bukan total)
         const sigData = {
-            amount: dto.amount,              // ⬅️ nominal ke rekening
+            amount: dto.amount,
             accountnumber: dto.account_number,
             bankcode: realBankCode,
             partnerreff: inquiryReff,
@@ -1023,13 +1457,12 @@ class WalletService {
             .update(JSON.stringify(sigData))
             .digest('hex');
 
-        // ✅ Payload LinkQu: amount = nominal (bukan total)
         const params = {
             username: LINKQU_CONFIG.username,
             pin: LINKQU_CONFIG.pin,
             bankcode: realBankCode,
             accountnumber: dto.account_number,
-            amount: dto.amount,              // ⬅️ nominal ke rekening
+            amount: dto.amount,
             partner_reff: inquiryReff,
             signature,
         };
@@ -1050,20 +1483,22 @@ class WalletService {
                     },
                 });
 
-            // ═══════════════════════════════════════════════════════════
-            // ✅ SIMPAN DENGAN fee_admin
-            // ═══════════════════════════════════════════════════════════
-            await supabaseAdmin.from('wallet_withdrawals').insert({
+            const { error: insErr } = await supabaseAdmin.from('wallet_withdrawals').insert({
                 user_id: userId,
+                wallet_type: walletType,            // ✅ dompet tujuan potongan
                 inquiry_reff: response.data.inquiry_reff ?? inquiryReff,
                 partner_reff: inquiryReff,
                 bank_code: realBankCode,
                 account_number: dto.account_number,
-                amount: dto.amount,              // ⬅️ nominal ke rekening (Rp10.000)
-                fee_admin: WITHDRAW_FEE,         // ⬅️ fee (Rp2.500)
+                amount: dto.amount,
+                fee_admin: WITHDRAW_FEE,
                 status: 'INQUIRY',
                 raw_response: response.data,
             });
+            if (insErr) {
+                logger.error('Insert wallet_withdrawals gagal', { error: insErr });
+                throw ApiError.internal('Gagal menyimpan inquiry withdraw');
+            }
 
             return {
                 ...response.data,
@@ -1073,20 +1508,30 @@ class WalletService {
                 total_deduction: totalDeduction,
             };
         } catch (err: any) {
+            if (err instanceof ApiError) throw err;
             logger.error('Withdraw inquiry error', {
                 error: err.response?.data || err.message,
             });
             throw ApiError.internal('Gagal inquiry withdraw');
         }
     }
+
     // ============================================================
     // WITHDRAW — EXECUTE
+    //
+    // Urutan baru (anti saldo negatif / uang keluar tanpa potongan):
+    //  1. Klaim atomik baris inquiry: INQUIRY -> PENDING
+    //     (execute ganda untuk inquiry yang sama ditolak).
+    //  2. POTONG saldo dulu, dengan guard saldo di bawah lock.
+    //  3. Baru kirim ke LinkQu.
+    //  4. Kalau LinkQu menolak jelas (ada response error) -> refund.
+    //     Kalau tidak ada response sama sekali (timeout) -> status
+    //     dibiarkan PENDING & saldo tetap terpotong; callback LinkQu /
+    //     admin yang memutuskan (hindari refund padahal uang sudah keluar).
+    //
+    // Dompet diambil dari baris inquiry (wallet_type), bukan dari request.
     // ============================================================
-    async withdrawExecute(
-        userId: string,
-        inquiryReff: string,
-        role: 'driver' | 'customer' = 'driver'
-    ) {
+    async withdrawExecute(userId: string, inquiryReff: string) {
         const { data: inq } = await supabaseAdmin
             .from('wallet_withdrawals')
             .select('*')
@@ -1099,13 +1544,58 @@ class WalletService {
             throw ApiError.badRequest('Inquiry sudah diproses');
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // ✅ HITUNG FEE ADMIN WITHDRAW
-        // ═══════════════════════════════════════════════════════════
-        const feeAdmin = Number(inq.fee_admin ?? 3000);      // Rp2.500
-        const nominalTransfer = Number(inq.amount);          // Rp10.000
-        const totalDeduction = nominalTransfer + feeAdmin;   // Rp12.500
+        const walletType: WalletType = ((inq as any).wallet_type as WalletType) ?? 'customer';
 
+        const feeAdmin = Number(inq.fee_admin ?? 3000);
+        const nominalTransfer = Number(inq.amount);
+        const totalDeduction = nominalTransfer + feeAdmin;
+
+        const partnerReffPay = `PAY${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+        // ── 1. Klaim atomik ──
+        const { data: claimed, error: claimErr } = await supabaseAdmin
+            .from('wallet_withdrawals')
+            .update({
+                status: 'PENDING',
+                partner_reff_pay: partnerReffPay,
+                updated_at: new Date().toISOString(),
+            })
+            .eq('id', inq.id)
+            .eq('status', 'INQUIRY')
+            .select('id');
+
+        if (claimErr) throw ApiError.internal('Gagal memproses withdraw');
+        if (!claimed || claimed.length === 0) {
+            throw ApiError.badRequest('Inquiry sudah diproses');
+        }
+
+        const releaseClaim = async () => {
+            await supabaseAdmin
+                .from('wallet_withdrawals')
+                .update({
+                    status: 'INQUIRY',
+                    partner_reff_pay: null,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq('id', inq.id);
+        };
+
+        // ── 2. Potong saldo (guard saldo di dalam lock) ──
+        try {
+            await this.debitWithdraw(walletType, userId, {
+                nominal: nominalTransfer,
+                feeAdmin,
+                totalDeduction,
+                bankCode: inq.bank_code,
+                accountNumber: inq.account_number,
+                partnerReff: partnerReffPay,
+            });
+        } catch (err) {
+            await releaseClaim(); // saldo tidak terpotong -> inquiry bisa dipakai lagi
+            throw err;
+        }
+
+        // ── 3. Kirim ke LinkQu ──
         const isEmoney = E_WALLET_CODES.includes(inq.bank_code.toUpperCase());
         let endpoint = '/transaction/withdraw/payment';
         let method: 'GET' | 'POST' = 'POST';
@@ -1116,11 +1606,6 @@ class WalletService {
             endpoint = '/transaction/transferva/payment';
         }
 
-        const partnerReffPay = `PAY${Date.now()}-${crypto
-            .randomBytes(4)
-            .toString('hex')}`;
-
-        // ✅ Signature pakai nominal transfer (bukan total)
         const sigData = {
             amount: nominalTransfer,
             accountnumber: inq.account_number,
@@ -1133,13 +1618,12 @@ class WalletService {
             .update(JSON.stringify(sigData))
             .digest('hex');
 
-        // ✅ Payload LinkQu: amount = nominal (yang dikirim ke rekening)
         const payload = {
             username: LINKQU_CONFIG.username,
             pin: LINKQU_CONFIG.pin,
             bankcode: inq.bank_code,
             accountnumber: inq.account_number,
-            amount: nominalTransfer,        // ⬅️ nominal Rp10.000
+            amount: nominalTransfer,
             partner_reff: partnerReffPay,
             inquiry_reff: inquiryReff,
             signature,
@@ -1147,6 +1631,7 @@ class WalletService {
             url_callback: LINKQU_CALLBACK_URL,
         };
 
+        let responseData: any;
         try {
             const response =
                 method === 'GET'
@@ -1157,168 +1642,125 @@ class WalletService {
                             'client-secret': LINKQU_CONFIG.clientSecret,
                         },
                     })
-                    : await axios.post(
-                        `${LINKQU_CONFIG.baseUrl}${endpoint}`,
-                        payload,
-                        {
-                            headers: {
-                                'client-id': LINKQU_CONFIG.clientId,
-                                'client-secret': LINKQU_CONFIG.clientSecret,
-                            },
-                        }
-                    );
-
-            const finalStatus =
-                response.data.status === 'SUCCESS' ? 'SUCCESS' : 'PENDING';
-
-            // ═══════════════════════════════════════════════════════════
-            // ✅ UPDATE STATUS + notified_at (kalau langsung SUCCESS)
-            // ═══════════════════════════════════════════════════════════
-            const notifiedAtNow =
-                finalStatus === 'SUCCESS' ? new Date().toISOString() : null;
-
-            await supabaseAdmin
-                .from('wallet_withdrawals')
-                .update({
-                    status: finalStatus,
-                    partner_reff_pay: partnerReffPay,
-                    notified_at: notifiedAtNow,
-                    raw_payment_response: response.data,
-                    updated_at: new Date().toISOString(),
-                })
-                .eq('inquiry_reff', inquiryReff);
-
-            // ═══════════════════════════════════════════════════════════
-            // ✅ UPDATE WALLET: potong saldo sebesar TOTAL (nominal + fee)
-            // ═══════════════════════════════════════════════════════════
-            if (role === 'driver') {
-                const driverWallet = await this.getWallet(userId, 'driver');
-                const newBalance = driverWallet.balance - totalDeduction; // ⬅️ Rp12.500
-
-                await supabaseAdmin
-                    .from('driver_wallets')
-                    .update({ balance: newBalance })
-                    .eq('driver_id', userId);
-
-                await supabaseAdmin.from('driver_wallet_ledger').insert({
-                    driver_id: userId,
-                    entry_type: 'withdraw',
-                    amount: totalDeduction,        // ⬅️ total Rp12.500
-                    direction: 'out',
-                    balance_after: newBalance,
-                    cash_debt_after: driverWallet.cash_debt,
-                    description: `Withdraw Rp${nominalTransfer.toLocaleString(
-                        'id-ID'
-                    )} ke ${inq.bank_code} ${inq.account_number} + fee Rp${feeAdmin.toLocaleString(
-                        'id-ID'
-                    )}`,
-                    metadata: {
-                        partner_reff: partnerReffPay,
-                        nominal: nominalTransfer,
-                        fee_admin: feeAdmin,
-                        total_deduction: totalDeduction,
-                    },
-                });
-            } else {
-                const customerWallet = await this.getWallet(userId, 'customer');
-                const newBalance = customerWallet.balance - totalDeduction; // ⬅️ Rp12.500
-
-                await supabaseAdmin
-                    .from('wallets')
-                    .update({ balance: newBalance })
-                    .eq('user_id', userId);
-
-                await supabaseAdmin.from('wallet_transactions').insert({
-                    user_id: userId,
-                    type: 'withdraw',
-                    amount: totalDeduction,        // ⬅️ total Rp12.500
-                    balance_after: newBalance,
-                    reference_id: partnerReffPay,
-                    description: `Withdraw Rp${nominalTransfer.toLocaleString(
-                        'id-ID'
-                    )} ke ${inq.bank_code} ${inq.account_number} + fee Rp${feeAdmin.toLocaleString(
-                        'id-ID'
-                    )}`,
-                });
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // ✅ NOTIFIKASI
-            // - SUCCESS  → "Penarikan Berhasil" (langsung)
-            // - PENDING  → "Penarikan Diproses"
-            // ═══════════════════════════════════════════════════════════
-            try {
-                if (finalStatus === 'SUCCESS') {
-                    await notificationService.sendToUser(userId, {
-                        title: 'Penarikan Berhasil',
-                        body:
-                            `Penarikan Rp${nominalTransfer.toLocaleString('id-ID')} ` +
-                            `ke ${inq.bank_code} ${inq.account_number} berhasil. ` +
-                            `Fee admin Rp${feeAdmin.toLocaleString('id-ID')}. ` +
-                            `Total dipotong Rp${totalDeduction.toLocaleString('id-ID')}.`,
-                        data: {
-                            type: 'withdraw_success',
-                            amount: nominalTransfer,
-                            fee_admin: feeAdmin,
-                            total_deduction: totalDeduction,
-                            inquiry_reff: inquiryReff,
-                            partner_reff: partnerReffPay,
+                    : await axios.post(`${LINKQU_CONFIG.baseUrl}${endpoint}`, payload, {
+                        headers: {
+                            'client-id': LINKQU_CONFIG.clientId,
+                            'client-secret': LINKQU_CONFIG.clientSecret,
                         },
                     });
+            responseData = response.data;
+        } catch (err: any) {
+            logger.error('Withdraw execute error', {
+                error: err.response?.data || err.message,
+            });
 
-                    logger.info('✅ Withdraw SUCCESS notif sent (execute)', {
+            if (err.response) {
+                // ── LinkQu menolak dengan jelas -> uang belum keluar -> refund ──
+                await supabaseAdmin
+                    .from('wallet_withdrawals')
+                    .update({
+                        status: 'FAILED',
+                        raw_payment_response: err.response.data ?? null,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq('id', inq.id);
+
+                try {
+                    await this.refundWithdrawal({ ...inq, wallet_type: walletType });
+                } catch (refundErr: any) {
+                    logger.error('🚨 Refund withdraw GAGAL setelah LinkQu menolak — perlu cek manual', {
                         inquiry_reff: inquiryReff,
                         userId,
-                        nominalTransfer,
-                        feeAdmin,
+                        walletType,
                         totalDeduction,
-                    });
-                } else {
-                    await notificationService.sendToUser(userId, {
-                        title: 'Penarikan Diproses',
-                        body:
-                            `Penarikan Rp${nominalTransfer.toLocaleString('id-ID')} ` +
-                            `ke ${inq.bank_code} ${inq.account_number} sedang diproses. ` +
-                            `Fee admin Rp${feeAdmin.toLocaleString('id-ID')}.`,
-                        data: {
-                            type: 'withdraw_pending',
-                            amount: nominalTransfer,
-                            fee_admin: feeAdmin,
-                            total_deduction: totalDeduction,
-                            inquiry_reff: inquiryReff,
-                            partner_reff: partnerReffPay,
-                        },
-                    });
-
-                    logger.info('⏳ Withdraw PENDING notif sent (execute)', {
-                        inquiry_reff: inquiryReff,
-                        userId,
-                        nominalTransfer,
-                        feeAdmin,
-                        totalDeduction,
+                        error: refundErr?.message ?? refundErr,
                     });
                 }
-            } catch (err: any) {
-                logger.warn('Gagal kirim notif withdraw (execute)', {
-                    inquiry_reff: inquiryReff,
-                    error: err.message,
-                });
+                throw ApiError.internal('Gagal memproses withdraw');
             }
 
+            // ── Tidak ada response (timeout/jaringan): status tidak pasti ──
+            logger.error('🚨 Withdraw status tidak pasti (tanpa response) — dibiarkan PENDING', {
+                inquiry_reff: inquiryReff,
+                userId,
+                walletType,
+                totalDeduction,
+            });
             return {
-                ...response.data,
-                internal_status: finalStatus,
+                internal_status: 'PENDING',
                 partner_reff: partnerReffPay,
                 amount: nominalTransfer,
                 fee_admin: feeAdmin,
                 total_deduction: totalDeduction,
             };
-        } catch (err: any) {
-            logger.error('Withdraw execute error', {
-                error: err.response?.data || err.message,
-            });
-            throw ApiError.internal('Gagal memproses withdraw');
         }
+
+        // ── 4. Simpan hasil ──
+        const finalStatus = responseData.status === 'SUCCESS' ? 'SUCCESS' : 'PENDING';
+        const notifiedAtNow = finalStatus === 'SUCCESS' ? new Date().toISOString() : null;
+
+        await supabaseAdmin
+            .from('wallet_withdrawals')
+            .update({
+                status: finalStatus,
+                partner_reff_pay: partnerReffPay,
+                notified_at: notifiedAtNow,
+                raw_payment_response: responseData,
+                updated_at: new Date().toISOString(),
+            })
+            .eq('id', inq.id);
+
+        // ── 5. Notifikasi (gagal kirim tidak boleh membatalkan withdraw) ──
+        try {
+            if (finalStatus === 'SUCCESS') {
+                await notificationService.sendToUser(userId, {
+                    title: 'Penarikan Berhasil',
+                    body:
+                        `Penarikan Rp${nominalTransfer.toLocaleString('id-ID')} ` +
+                        `ke ${inq.bank_code} ${inq.account_number} berhasil. ` +
+                        `Fee admin Rp${feeAdmin.toLocaleString('id-ID')}. ` +
+                        `Total dipotong Rp${totalDeduction.toLocaleString('id-ID')}.`,
+                    data: {
+                        type: 'withdraw_success',
+                        amount: nominalTransfer,
+                        fee_admin: feeAdmin,
+                        total_deduction: totalDeduction,
+                        inquiry_reff: inquiryReff,
+                        partner_reff: partnerReffPay,
+                    },
+                });
+            } else {
+                await notificationService.sendToUser(userId, {
+                    title: 'Penarikan Diproses',
+                    body:
+                        `Penarikan Rp${nominalTransfer.toLocaleString('id-ID')} ` +
+                        `ke ${inq.bank_code} ${inq.account_number} sedang diproses. ` +
+                        `Fee admin Rp${feeAdmin.toLocaleString('id-ID')}.`,
+                    data: {
+                        type: 'withdraw_pending',
+                        amount: nominalTransfer,
+                        fee_admin: feeAdmin,
+                        total_deduction: totalDeduction,
+                        inquiry_reff: inquiryReff,
+                        partner_reff: partnerReffPay,
+                    },
+                });
+            }
+        } catch (err: any) {
+            logger.warn('Gagal kirim notif withdraw (execute)', {
+                inquiry_reff: inquiryReff,
+                error: err.message,
+            });
+        }
+
+        return {
+            ...responseData,
+            internal_status: finalStatus,
+            partner_reff: partnerReffPay,
+            amount: nominalTransfer,
+            fee_admin: feeAdmin,
+            total_deduction: totalDeduction,
+        };
     }
 
     // ============================================================
@@ -1674,38 +2116,29 @@ class WalletService {
         };
     }
     // Di wallet.service.ts
+    // Bayar order pakai saldo customer. Potong saldo di bawah lock + guard,
+    // jadi dua pembayaran bersamaan tidak bisa membuat saldo negatif.
     async payWithWallet(userId: string, orderId: number, amount: number) {
         logger.info('[wallet.payWithWallet] START', { userId, orderId, amount });
 
-        // 1. Cek saldo
-        const wallet = await this.getWallet(userId, 'customer');
-        if (wallet.balance < amount) {
-            throw ApiError.badRequest(
-                `Saldo tidak cukup. Butuh Rp${amount.toLocaleString('id-ID')}, ` +
-                `saldo: Rp${wallet.balance.toLocaleString('id-ID')}`
-            );
-        }
-
-        // 2. Potong saldo (race-safe)
-        const newBalance = wallet.balance - amount;
-
-        const { error: updateErr } = await supabaseAdmin
-            .from('wallets')
-            .update({ balance: newBalance, updated_at: new Date().toISOString() })
-            .eq('user_id', userId);
-
-        if (updateErr) {
-            throw ApiError.internal('Gagal potong saldo: ' + updateErr.message);
-        }
-
-        // 3. Insert transaksi
-        await supabaseAdmin.from('wallet_transactions').insert({
-            user_id: userId,
-            type: 'order_payment',
-            amount,
-            balance_after: newBalance,
-            reference_id: `ORDER-${orderId}`,
-            description: `Pembayaran order #${orderId}`,
+        const newBalance = await this.mutateCustomer(userId, (balance) => {
+            if (balance < amount) {
+                throw ApiError.badRequest(
+                    `Saldo tidak cukup. Butuh Rp${amount.toLocaleString('id-ID')}, ` +
+                    `saldo: Rp${balance.toLocaleString('id-ID')}`
+                );
+            }
+            const nb = balance - amount;
+            return {
+                newBalance: nb,
+                tx: {
+                    type: 'order_payment',
+                    amount,
+                    reference_id: `ORDER-${orderId}`,
+                    description: `Pembayaran order #${orderId}`,
+                },
+                result: nb,
+            };
         });
 
         logger.info('[wallet.payWithWallet] ✅ Sukses', {

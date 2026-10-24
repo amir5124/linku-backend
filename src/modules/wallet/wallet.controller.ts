@@ -1,6 +1,6 @@
 // src/modules/wallet/wallet.controller.ts
 import { Request, Response, NextFunction } from 'express';
-import { walletService } from './wallet.service';
+import { walletService, type WalletType } from './wallet.service';
 import { merchantWalletService } from './merchant-wallet.service';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created } from '../../utils/response';
@@ -8,10 +8,31 @@ import { ApiError } from '../../utils/ApiError';
 
 
 // ============================================================
-// Helper: role user untuk wallet
+// Helper: role user untuk wallet (BACA — getWallet / ledger)
 // ============================================================
 function resolveWalletRole(req: Request): 'driver' | 'customer' {
     return req.user?.role === 'driver' ? 'driver' : 'customer';
+}
+
+// ============================================================
+// Helper: dompet tujuan untuk TOPUP & WITHDRAW (UANG MASUK/KELUAR)
+//
+// Dompet SELALU ditentukan dari role akun yang login (token),
+// tidak pernah dari body request. Nilainya disimpan di baris
+// wallet_topups / wallet_withdrawals, jadi callback dan execute
+// memakai dompet yang sama dengan saat inquiry.
+//
+// Merchant punya dompet sendiri (merchant_wallets). Top up & withdraw
+// merchant belum lewat endpoint ini, jadi ditolak supaya uangnya tidak
+// masuk ke dompet customer yang salah.
+// ============================================================
+function resolveMoneyWalletType(req: Request): WalletType {
+    const role = req.user?.role;
+    if (role === 'driver') return 'driver';
+    if (role === 'customer') return 'customer';
+    throw ApiError.badRequest(
+        'Top up dan penarikan untuk akun ini belum tersedia lewat endpoint ini'
+    );
 }
 
 export const walletController = {
@@ -96,6 +117,7 @@ export const walletController = {
     // ============================================================
     topupInquiry: asyncHandler(async (req: Request, res: Response) => {
         const { amount, method, bank_code } = req.body;
+        const walletType = resolveMoneyWalletType(req); // ← dari role, bukan body
 
         if (!amount || Number(amount) < 100)
             throw ApiError.badRequest('Minimal topup Rp10.000');
@@ -108,6 +130,7 @@ export const walletController = {
             amount: Number(amount),
             method,
             bank_code,
+            walletType,
         });
         return ok(res, data, 'Inquiry topup berhasil');
     }),
@@ -142,7 +165,7 @@ export const walletController = {
     // ============================================================
     withdrawInquiry: asyncHandler(async (req: Request, res: Response) => {
         const { amount, bank_code, account_number } = req.body;
-        const role = resolveWalletRole(req);
+        const walletType = resolveMoneyWalletType(req); // ← dari role, bukan body
 
         if (!amount || Number(amount) <= 0)
             throw ApiError.badRequest('Jumlah tidak valid');
@@ -153,24 +176,24 @@ export const walletController = {
             amount: Number(amount),
             bank_code,
             account_number,
-            role,
+            walletType,
         });
         return ok(res, data, 'Inquiry withdraw berhasil');
     }),
 
     // ============================================================
     // POST /api/wallet/withdraw/execute
+    // Dompet diambil dari baris inquiry (wallet_type), bukan dari request.
     // ============================================================
     withdrawExecute: asyncHandler(async (req: Request, res: Response) => {
         const { inquiry_reff } = req.body;
-        const role = resolveWalletRole(req);
+        resolveMoneyWalletType(req); // tolak role yang belum didukung
 
         if (!inquiry_reff) throw ApiError.badRequest('inquiry_reff wajib');
 
         const data = await walletService.withdrawExecute(
             req.user!.id,
-            inquiry_reff,
-            role
+            inquiry_reff
         );
         return created(res, data, 'Penarikan sedang diproses');
     }),

@@ -78,23 +78,8 @@ class MerchantWalletService {
         return (data as any)?.role === 'merchant';
     }
 
-    // orders.merchant_id -> user pemilik toko.
-    // ASUMSI: tabel merchants punya kolom owner_id. Kalau tabelnya tidak ada /
-    // tidak ketemu, merchant_id dianggap sudah berupa user id.
-    private async resolveMerchantUserId(merchantId: string): Promise<string> {
-        try {
-            const { data } = await supabaseAdmin
-                .from('merchants')
-                .select('owner_id')
-                .eq('id', merchantId)
-                .maybeSingle();
-            const ownerId = (data as any)?.owner_id;
-            if (ownerId) return String(ownerId);
-        } catch {
-            /* fallback di bawah */
-        }
-        return merchantId;
-    }
+    // orders.merchant_id = id USER pemilik toko (FK ke merchant_profiles.user_id),
+    // jadi langsung dipakai sebagai kunci merchant_wallets.
 
     private async numSetting(key: string, fallback: number): Promise<number> {
         try {
@@ -321,7 +306,7 @@ class MerchantWalletService {
             const commission = Math.round(gross * rate);
             const earning = gross - commission;
             const isCash = order.payment_method === 'cash';
-            const merchantUserId = await this.resolveMerchantUserId(String(order.merchant_id));
+            const merchantUserId = String(order.merchant_id);
 
             let result: { balance: number; cash_debt: number; to_debt: number; debt_paid: number };
 
@@ -573,6 +558,12 @@ class MerchantWalletService {
         }
     ) {
         return this.mutate(userId, null, (w) => {
+            // Guard di bawah lock: dua withdraw bersamaan tidak bisa bikin saldo negatif
+            if (Number(w.balance) < info.totalDeduction) {
+                throw ApiError.badRequest(
+                    `Saldo tidak cukup. Butuh ${rp(info.totalDeduction)}, saldo: ${rp(Number(w.balance))}`
+                );
+            }
             const newBalance = Number(w.balance) - info.totalDeduction;
             const debt = Number(w.cash_debt);
             return {
