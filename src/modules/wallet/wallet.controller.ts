@@ -1,10 +1,11 @@
 // src/modules/wallet/wallet.controller.ts
-import { Request, Response } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import { walletService } from './wallet.service';
 import { merchantWalletService } from './merchant-wallet.service';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { ok, created } from '../../utils/response';
 import { ApiError } from '../../utils/ApiError';
+
 
 // ============================================================
 // Helper: role user untuk wallet
@@ -255,4 +256,13 @@ export const walletController = {
         );
         return ok(res, data, 'Transaction history');
     }),
+
+    getMerchantEligibility: async (req: Request, res: Response, next: NextFunction) => {
+        try {
+            const data = await merchantWalletService.getEligibility(req.user!.id);
+            res.json({ success: true, data });
+        } catch (e) {
+            next(e);
+        }
+    },
 };

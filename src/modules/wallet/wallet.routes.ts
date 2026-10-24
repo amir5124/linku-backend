@@ -15,6 +15,15 @@ router.get('/ledger', walletController.listLedger);
 router.get('/history', walletController.listLedger); // alias lama
 
 // ============================================================
+// ENDPOINT KHUSUS MERCHANT
+// ============================================================
+router.get(
+    '/eligibility',
+    requireRole('merchant'),
+    walletController.getMerchantEligibility
+);
+
+// ============================================================
 // 🆕 HISTORY TRANSAKSI
 // ============================================================
 router.get('/topups', walletController.listTopups);
