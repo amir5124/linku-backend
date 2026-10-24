@@ -1,6 +1,7 @@
-// src/modules/settings/settings.routes.ts
+// src/modules/settings/settings.routes.ts  (dipasang di /api/settings)
 import { Router } from 'express';
 import { supabaseAdmin } from '../../config/supabase';
+import { settingsService } from './settings.service';
 
 const router = Router();
 
@@ -38,6 +39,22 @@ router.get('/public', async (_req, res, next) => {
         }
 
         res.json({ success: true, data: settings });
+    } catch (err) {
+        next(err);
+    }
+});
+
+/**
+ * GET /api/settings/driver-rules
+ * Aturan saldo driver, dibaca dari app_settings:
+ *   { min_balance: 10000, free_orders: 5 }
+ * Publik — tidak perlu auth (bukan data rahasia, dan app driver
+ * perlu membacanya untuk banner kuota di beranda).
+ */
+router.get('/driver-rules', async (_req, res, next) => {
+    try {
+        const data = await settingsService.getDriverRules();
+        res.json({ success: true, data });
     } catch (err) {
         next(err);
     }

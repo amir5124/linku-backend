@@ -1,18 +1,26 @@
 // src/modules/settings/settings.service.ts
 //
-// CRUD pengaturan aplikasi (tabel app_settings), termasuk pengaturan komisi.
+// CRUD pengaturan aplikasi (tabel app_settings), termasuk pengaturan komisi
+// dan aturan driver (saldo minimal & kuota order gratis).
 // Kolom yang dipakai (dari kode yang sudah ada): key, value (teks), value_type,
 // category, is_public, updated_by.
 
 import { supabaseAdmin as sb } from '../../config/supabase';
 import { ApiError } from '../../utils/ApiError';
 import { audit } from '../admin/admin.service';
+import { getDriverRules as loadDriverRules } from '../order/driver-eligibility';
 
 export const VALUE_TYPES = ['number', 'boolean', 'string', 'json'] as const;
 export type ValueType = (typeof VALUE_TYPES)[number];
 
 const KEY_RE = /^[a-z][a-z0-9_.]{1,63}$/;
 const isCommissionKey = (k: string) => /commission|komisi/i.test(k);
+
+// Key yang dibaca driver-eligibility.ts (matching & accept order)
+const DRIVER_MIN_BALANCE_KEY = 'driver_min_balance';
+const DRIVER_FREE_ORDERS_KEY = 'driver_free_orders';
+const MAX_MIN_BALANCE = 10_000_000;
+const MAX_FREE_ORDERS = 1_000;
 
 /** Validasi nilai sesuai tipe dan kembalikan string yang akan disimpan. */
 function normalizeValue(key: string, type: ValueType, raw: unknown, enforceRate: boolean): string {
@@ -49,6 +57,15 @@ function normalizeValue(key: string, type: ValueType, raw: unknown, enforceRate:
             }
             return String(v);
     }
+}
+
+/** Bilangan bulat >= 0 dan <= max, kalau tidak lempar 400. */
+function parseWholeNumber(raw: unknown, label: string, max: number): number {
+    const n = typeof raw === 'string' ? Number(raw.trim()) : Number(raw);
+    if (raw === '' || raw === null || !Number.isInteger(n) || n < 0 || n > max) {
+        throw ApiError.badRequest(`${label} harus bilangan bulat antara 0 dan ${max.toLocaleString('id-ID')}`);
+    }
+    return n;
 }
 
 export const settingsService = {
@@ -134,5 +151,67 @@ export const settingsService = {
         if (error) throw ApiError.internal(error.message);
         if (!data?.length) throw ApiError.notFound('Setting tidak ditemukan');
         await audit(adminId, 'delete_setting', 'setting', key, { value: data[0].value });
+    },
+
+    // ============================================================
+    // ATURAN DRIVER — saldo minimal & kuota order gratis
+    // Dibaca langsung dari app_settings (sumber yang sama dengan
+    // filterDriversByBalance & assertDriverCanAccept).
+    // Kalau barisnya belum ada, nilai bawaan: 10000 dan 5.
+    // ============================================================
+    async getDriverRules() {
+        const { min, free } = await loadDriverRules();
+        return { min_balance: min, free_orders: free };
+    },
+
+    /**
+     * Ubah satu atau kedua aturan sekaligus. Baris dibuat kalau belum ada
+     * (upsert), bertipe number, kategori 'driver', dan is_public = true
+     * supaya juga muncul di GET /api/settings/public.
+     *
+     * Catatan: min_balance = 0 berarti pengecekan saldo dimatikan
+     * (semua driver boleh menerima order).
+     */
+    async updateDriverRules(
+        body: { min_balance?: unknown; free_orders?: unknown },
+        adminId?: string
+    ) {
+        const rows: { key: string; value: string }[] = [];
+
+        if (body.min_balance !== undefined) {
+            const n = parseWholeNumber(body.min_balance, 'min_balance', MAX_MIN_BALANCE);
+            rows.push({ key: DRIVER_MIN_BALANCE_KEY, value: String(n) });
+        }
+        if (body.free_orders !== undefined) {
+            const n = parseWholeNumber(body.free_orders, 'free_orders', MAX_FREE_ORDERS);
+            rows.push({ key: DRIVER_FREE_ORDERS_KEY, value: String(n) });
+        }
+        if (rows.length === 0) {
+            throw ApiError.badRequest('Isi min_balance dan/atau free_orders');
+        }
+
+        const before = await loadDriverRules();
+
+        const { error } = await sb.from('app_settings').upsert(
+            rows.map((r) => ({
+                key: r.key,
+                value: r.value,
+                value_type: 'number',
+                category: 'driver',
+                is_public: true,
+                updated_by: adminId ?? null,
+            })),
+            { onConflict: 'key' }
+        );
+        if (error) throw ApiError.internal(error.message);
+
+        const after = await loadDriverRules();
+
+        await audit(adminId, 'update_driver_rules', 'setting', 'driver_rules', {
+            old: { min_balance: before.min, free_orders: before.free },
+            new: { min_balance: after.min, free_orders: after.free },
+        });
+
+        return { min_balance: after.min, free_orders: after.free };
     },
 };

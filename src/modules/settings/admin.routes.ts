@@ -13,6 +13,27 @@ const adminId = (req: any) => req.user?.id as string | undefined;
 /** GET /api/admin/settings — list semua setting */
 router.get('/', asyncHandler(async (_req, res) => ok(res, await settingsService.list())));
 
+/**
+ * GET /api/admin/settings/driver-rules — aturan saldo driver saat ini
+ * (harus dideklarasikan SEBELUM route '/:key' supaya tidak dianggap key)
+ */
+router.get(
+    '/driver-rules',
+    asyncHandler(async (_req, res) => ok(res, await settingsService.getDriverRules()))
+);
+
+/**
+ * PUT /api/admin/settings/driver-rules
+ * Body: { "min_balance": 10000, "free_orders": 5 }  (boleh salah satu saja)
+ * min_balance = 0 → pengecekan saldo dimatikan.
+ */
+router.put(
+    '/driver-rules',
+    asyncHandler(async (req, res) =>
+        ok(res, await settingsService.updateDriverRules(req.body ?? {}, adminId(req)), 'Aturan driver diupdate')
+    )
+);
+
 /** POST /api/admin/settings — buat setting baru */
 router.post(
     '/',
