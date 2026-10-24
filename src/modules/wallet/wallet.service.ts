@@ -631,7 +631,8 @@ class WalletService {
     //     (sebelumnya newBalance + balanceCredit, seharusnya dikurangi).
     //  5. total_commission_paid ikut bertambah saat utang cash dilunasi
     //     dari order gateway (sebelumnya hanya komisi order itu sendiri).
-    //  6. Order CASH: komisi dipotong dari SALDO dulu, sisanya baru jadi utang.
+    //  6. Order CASH: utang lama dilunasi dari SALDO dulu, lalu komisi order ini
+    //     dipotong dari saldo, sisanya baru jadi utang.
     //  7. Komisi toko (food) ikut diproses lewat merchantWalletService
     //     (idempotent, tidak pernah throw).
     // ============================================================
@@ -748,9 +749,19 @@ class WalletService {
                 let cashToDebt = 0;
 
                 if (isCash) {
-                    // ── CASH: uang order sudah di tangan driver. Komisi ditagih:
-                    //    potong SALDO dulu, kekurangannya baru jadi UTANG.
+                    // ── CASH: uang order sudah di tangan driver.
+                    //    1) Utang komisi LAMA dilunasi dari SALDO dulu.
+                    //    2) Komisi order ini dipotong dari sisa SALDO.
+                    //    3) Kekurangannya baru jadi UTANG.
                     const debtBefore = newCashDebt;
+
+                    const debtPaidCash = Math.min(Math.max(newBalance, 0), newCashDebt);
+                    newBalance -= debtPaidCash;
+                    newCashDebt -= debtPaidCash;
+                    totalDebtPaid = debtPaidCash;
+                    const balanceAfterDebt = newBalance;
+                    const debtAfterDebtPayment = newCashDebt;
+
                     cashFromBalance = Math.min(Math.max(newBalance, 0), commissionAmount);
                     cashToDebt = commissionAmount - cashFromBalance;
                     newBalance -= cashFromBalance;
@@ -770,6 +781,21 @@ class WalletService {
                             ...foodMeta,
                         },
                     });
+                    if (debtPaidCash > 0) {
+                        ledger.push({
+                            entry_type: 'debt_payment',
+                            amount: debtPaidCash,
+                            direction: 'out',
+                            balance_after: balanceAfterDebt,
+                            cash_debt_after: debtAfterDebtPayment,
+                            description: 'Pelunasan utang komisi lama dari saldo (order tunai)',
+                            metadata: {
+                                source: 'balance_cash_order',
+                                debt_paid: debtPaidCash,
+                                order_id: order.id,
+                            },
+                        });
+                    }
                     ledger.push({
                         entry_type: 'commission_cash',
                         amount: commissionAmount,
@@ -916,7 +942,7 @@ class WalletService {
         }
 
         if (result.totalDebtPaid > 0) {
-            logger.info('Auto-lunasi utang cash saat order gateway', {
+            logger.info('Auto-lunasi utang cash saat settle order', {
                 orderId: order.id,
                 driverId,
                 totalDebtPaid: result.totalDebtPaid,
