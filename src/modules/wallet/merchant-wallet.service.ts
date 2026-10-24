@@ -16,8 +16,13 @@ const DEFAULT_MERCHANT_COMMISSION = 0.12;
 
 // Batas utang komisi cash. Lewat batas ini toko tidak boleh menerima order cash baru.
 export const MERCHANT_DEBT_LIMIT = Number(process.env.MERCHANT_DEBT_LIMIT ?? 100000);
-// Saldo bersih minimal agar toko boleh buka/online.
-export const MERCHANT_MIN_BALANCE = Number(process.env.MERCHANT_MIN_BALANCE ?? 20000);
+// Saldo bersih minimal agar toko boleh buka/online & menerima order.
+// Nilai di sini hanya cadangan: bisa diubah tanpa deploy lewat tabel
+// app_settings (key: merchant_min_balance, merchant_free_orders).
+export const MERCHANT_MIN_BALANCE = Number(process.env.MERCHANT_MIN_BALANCE ?? 10000);
+// Kuota order GRATIS: toko dengan order selesai kurang dari ini boleh menerima
+// order walau saldo kurang dari minimum. Setelah kuota habis → wajib saldo minimal.
+export const MERCHANT_FREE_ORDERS = Number(process.env.MERCHANT_FREE_ORDERS ?? 5);
 
 // ============================================================
 // TYPES
@@ -89,6 +94,20 @@ class MerchantWalletService {
             /* fallback di bawah */
         }
         return merchantId;
+    }
+
+    private async numSetting(key: string, fallback: number): Promise<number> {
+        try {
+            const { data } = await supabaseAdmin
+                .from('app_settings')
+                .select('value')
+                .eq('key', key)
+                .maybeSingle();
+            const n = Number(data?.value);
+            return data?.value != null && Number.isFinite(n) && n >= 0 ? n : fallback;
+        } catch {
+            return fallback;
+        }
     }
 
     private async getRate(): Promise<number> {
@@ -216,20 +235,47 @@ class MerchantWalletService {
     // ============================================================
     async getEligibility(userId: string) {
         const w = await this.getWallet(userId);
+
+        const [minBalance, freeOrders] = await Promise.all([
+            this.numSetting('merchant_min_balance', MERCHANT_MIN_BALANCE),
+            this.numSetting('merchant_free_orders', MERCHANT_FREE_ORDERS),
+        ]);
+
+        // Order makanan yang sudah selesai = pemakaian kuota gratis
+        const { count } = await supabaseAdmin
+            .from('orders')
+            .select('id', { count: 'exact', head: true })
+            .eq('merchant_id', userId)
+            .eq('type', 'food')
+            .eq('status', 'completed');
+        const completedOrders = count ?? 0;
+        const freeLeft = Math.max(freeOrders - completedOrders, 0);
+
         const canCash = w.cash_debt < MERCHANT_DEBT_LIMIT;
-        const canOnline = canCash && w.net_balance >= MERCHANT_MIN_BALANCE;
+        // Boleh terima order: masih punya kuota gratis ATAU saldo bersih cukup
+        const balanceOk =
+            minBalance <= 0 || freeLeft > 0 || w.net_balance >= minBalance;
+        const canOnline = canCash && balanceOk;
 
         let reason: string | null = null;
         if (!canCash) {
             reason = `Utang komisi ${rp(w.cash_debt)} melewati batas ${rp(MERCHANT_DEBT_LIMIT)}. Top up untuk melunasi.`;
-        } else if (!canOnline) {
-            reason = `Saldo bersih minimal ${rp(MERCHANT_MIN_BALANCE)} agar toko bisa menerima pesanan.`;
+        } else if (!balanceOk) {
+            reason =
+                `Kuota ${freeOrders} order gratis sudah habis. ` +
+                `Saldo bersih minimal ${rp(minBalance)} agar toko bisa menerima pesanan ` +
+                `(saldo bersih kamu ${rp(w.net_balance)}).`;
         }
         return {
             can_accept_cash_orders: canCash,
+            can_accept_orders: balanceOk,
             can_go_online: canOnline,
             debt_limit: MERCHANT_DEBT_LIMIT,
-            min_balance: MERCHANT_MIN_BALANCE,
+            min_balance: minBalance,
+            free_orders: freeOrders,
+            free_orders_left: freeLeft,
+            completed_orders: completedOrders,
+            net_balance: w.net_balance,
             reason,
         };
     }

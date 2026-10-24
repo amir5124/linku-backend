@@ -6,6 +6,7 @@ import { notificationService } from '../notification/notification.service';
 import { merchantWalletService } from '../wallet/merchant-wallet.service';
 import { logger } from '../../config/logger';
 import { assertDriverCanAccept } from './driver-eligibility';
+
 import {
     kindOf,
     newOrderForDriver,
@@ -513,12 +514,22 @@ export const orderService = {
             );
         }
 
-        if (input.type === 'food' && paymentMethod === 'cash') {
+        // Toko harus punya kuota gratis / saldo cukup (semua metode bayar),
+        // dan untuk tunai utang komisinya belum melewati batas.
+        if (input.type === 'food') {
             try {
                 const elig = await merchantWalletService.getEligibility(
                     String(input.merchant_id)
                 );
-                if (!elig.can_accept_cash_orders) {
+                if (!elig.can_accept_orders) {
+                    logger.warn('[order.create] Toko tidak memenuhi syarat saldo', {
+                        merchantId: input.merchant_id,
+                    });
+                    throw ApiError.badRequest(
+                        'Toko sedang tidak dapat menerima pesanan. Silakan pilih toko lain atau coba lagi nanti.'
+                    );
+                }
+                if (paymentMethod === 'cash' && !elig.can_accept_cash_orders) {
                     logger.warn('[order.create] Toko melewati batas utang, cash ditolak', {
                         merchantId: input.merchant_id,
                     });
@@ -912,6 +923,13 @@ export const orderService = {
         // ============================================================
         if (accept) {
             await assertMerchantOpen(merchantId, 'order.merchantRespond');
+
+            const elig = await merchantWalletService.getEligibility(merchantId);
+            if (!elig.can_accept_orders) {
+                throw ApiError.badRequest(
+                    elig.reason ?? 'Saldo toko belum mencukupi untuk menerima pesanan.'
+                );
+            }
         }
 
         const now = new Date().toISOString();
@@ -1443,7 +1461,8 @@ export const orderService = {
             throw ApiError.forbidden('Akun belum terverifikasi');
         }
 
-        await assertDriverCanAccept(driverId);   // ← di luar if, satu baris saja
+        // Kuota order gratis habis → wajib saldo minimal
+        await assertDriverCanAccept(driverId);
 
         const { data, error } = await supabaseAdmin
             .from('orders')
