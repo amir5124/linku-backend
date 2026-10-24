@@ -20,6 +20,12 @@ export async function getDriverRules() {
     return { min, free };
 }
 
+/**
+ * Saldo driver = driver_wallets.balance (sama dengan angka "saldo" di banner app,
+ * yang berasal dari GET /api/drivers/earnings).
+ * Bukan tabel `wallets` (itu dompet customer).
+ */
+
 /** Buang driver yang kuota gratisnya habis DAN saldonya kurang dari minimum. */
 export async function filterDriversByBalance<T extends { user_id: string }>(
     drivers: T[]
@@ -39,18 +45,19 @@ export async function filterDriversByBalance<T extends { user_id: string }>(
     const ids = drivers.map((d) => d.user_id);
     const [dpRes, wRes] = await Promise.all([
         supabaseAdmin.from('driver_profiles').select('user_id,total_trips').in('user_id', ids),
-        supabaseAdmin.from('wallets').select('user_id,balance').in('user_id', ids),
+        supabaseAdmin.from('driver_wallets').select('driver_id,balance,cash_debt').in('driver_id', ids),
     ]);
 
     if (dpRes.error) {
         logger.error('[eligibility] gagal ambil total_trips', { error: dpRes.error.message });
     }
     if (wRes.error) {
-        logger.error('[eligibility] gagal ambil saldo wallet', { error: wRes.error.message });
+        logger.error('[eligibility] gagal ambil saldo driver_wallets', { error: wRes.error.message });
     }
 
     const trips = new Map((dpRes.data ?? []).map((r: any) => [r.user_id, Number(r.total_trips ?? 0)]));
-    const bal = new Map((wRes.data ?? []).map((r: any) => [r.user_id, Number(r.balance ?? 0)]));
+    const bal = new Map((wRes.data ?? []).map((r: any) => [r.driver_id, Number(r.balance ?? 0)]));
+    const debt = new Map((wRes.data ?? []).map((r: any) => [r.driver_id, Number(r.cash_debt ?? 0)]));
 
     const passed: T[] = [];
     const stat = { gratis: 0, saldoCukup: 0, ditolak: 0 };
@@ -59,6 +66,7 @@ export async function filterDriversByBalance<T extends { user_id: string }>(
         const t = trips.get(d.user_id) ?? 0;
         const hasWallet = bal.has(d.user_id);
         const b = bal.get(d.user_id) ?? 0;
+        const cd = debt.get(d.user_id) ?? 0;
         const sisa = Math.max(free - t, 0);
         const inFreeQuota = t < free;
         const saldoOk = b >= min;
@@ -79,7 +87,8 @@ export async function filterDriversByBalance<T extends { user_id: string }>(
 
         console.log(
             `[eligibility] driver ${d.user_id} | trips: ${t}/${free} (sisa gratis: ${sisa}) | ` +
-            `saldo: ${rp(b)}${hasWallet ? '' : ' (wallet tidak ada)'} | min: ${rp(min)} | ${verdict}`
+            `saldo: ${rp(b)}${hasWallet ? '' : ' (driver_wallets tidak ada)'} | utang tunai: ${rp(cd)} | ` +
+            `min: ${rp(min)} | ${verdict}`
         );
     }
 
@@ -98,7 +107,7 @@ export async function assertDriverCanAccept(driverId: string) {
 
     const [{ data: dp }, { data: w }] = await Promise.all([
         supabaseAdmin.from('driver_profiles').select('total_trips').eq('user_id', driverId).maybeSingle(),
-        supabaseAdmin.from('wallets').select('balance').eq('user_id', driverId).maybeSingle(),
+        supabaseAdmin.from('driver_wallets').select('balance').eq('driver_id', driverId).maybeSingle(),
     ]);
     const trips = Number(dp?.total_trips ?? 0);
     const balance = Number(w?.balance ?? 0);
