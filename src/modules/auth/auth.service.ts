@@ -17,7 +17,7 @@ export const authService = {
             .select('id')
             .eq('email', email)
             .maybeSingle();
-        if (existing) throw ApiError.conflict('Email already registered');
+        if (existing) throw ApiError.conflict('Email sudah terdaftar');
 
         const { data: authUser, error: authErr } = await supabaseAdmin.auth.admin.createUser({
             email,
@@ -71,7 +71,7 @@ export const authService = {
             .select('id, role')
             .eq('email', normalizedEmail)
             .maybeSingle();
-        if (!profile) throw ApiError.unauthorized('Email or password wrong');
+        if (!profile) throw ApiError.unauthorized('Email atau kata sandi salah');
 
         // ✅ FIX: pakai client sekali pakai, BUKAN supabaseAdmin,
         // supaya sesi user tidak menempel di client admin.
@@ -83,7 +83,7 @@ export const authService = {
 
         if (error || !signIn?.user) {
             logger.warn('Login failed', { email: normalizedEmail, error: error?.message });
-            throw ApiError.unauthorized('Email or password wrong');
+            throw ApiError.unauthorized('Email atau kata sandi salah');
         }
 
         const token = signJwt({
