@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../../config/supabase';
 import { ApiError } from '../../utils/ApiError';
+import { logger } from '../../config/logger';
 
 export const profileService = {
     async update(
@@ -28,10 +29,32 @@ export const profileService = {
 
         if (patch.email !== undefined) clean.email = patch.email.trim().toLowerCase();
         if (patch.avatar_url !== undefined) clean.avatar_url = patch.avatar_url;
-        if (patch.fcm_token !== undefined) clean.fcm_token = patch.fcm_token;
+
+        if (patch.fcm_token !== undefined) {
+            // String kosong = hapus token (dikirim aplikasi saat logout)
+            const t = typeof patch.fcm_token === 'string' ? patch.fcm_token.trim() : '';
+            clean.fcm_token = t || null;
+        }
 
         if (Object.keys(clean).length === 0) {
             throw ApiError.badRequest('No fields to update');
+        }
+
+        // Satu token push hanya boleh dimiliki satu akun. Kalau perangkat ini
+        // sebelumnya dipakai akun lain (dan logout-nya gagal membersihkan token),
+        // lepaskan token dari akun lama supaya notifikasi tidak salah alamat.
+        if (clean.fcm_token) {
+            const { error: dedupeErr } = await supabaseAdmin
+                .from('profiles')
+                .update({ fcm_token: null })
+                .eq('fcm_token', clean.fcm_token)
+                .neq('id', userId);
+            if (dedupeErr) {
+                logger.warn('Gagal melepas fcm_token dari akun lain', {
+                    userId,
+                    error: dedupeErr.message,
+                });
+            }
         }
 
         const { data, error } = await supabaseAdmin

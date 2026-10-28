@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { activityService, QuoteBody } from './activity.service';
 
-const SERVICES = ['ride', 'send', 'food'];
+const SERVICES = ['ride', 'send', 'food', 'jastip'];
 
 const userIdOf = (req: Request): string => (req as any).user.id; // ← sesuaikan bila bentuk req.user beda
 
