@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '../../config/supabase';
 export type QuoteBody = {
-    service: 'ride' | 'send' | 'food' | 'jastip';
+    service: 'ride' | 'send' | 'food';
     origin_name?: string | null;
     origin_lat?: number | null;
     origin_lng?: number | null;

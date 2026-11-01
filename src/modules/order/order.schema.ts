@@ -1,9 +1,5 @@
-// src/modules/order/order.schema.ts
 import { z } from 'zod';
 
-// ============================================================
-// CREATE ORDER SCHEMA
-// ============================================================
 export const createOrderSchema = z
     .object({
         body: z.object({
@@ -40,8 +36,6 @@ export const createOrderSchema = z
             tariff_code: z.string().optional(),
             option_name: z.string().optional(),
 
-            // items: food pakai menu_item_id + price,
-            //        jastip pakai name + qty + est_price + variant (tanpa menu_item_id)
             items: z
                 .array(
                     z.object({
@@ -50,7 +44,7 @@ export const createOrderSchema = z
                         variant: z.string().max(200).optional(),
                         qty: z.number().int().min(1).max(99),
                         price: z.number().min(0).optional(),
-                        est_price: z.number().min(0).optional(), // jastip
+                        est_price: z.number().min(0).optional(),
                     })
                 )
                 .optional(),
@@ -71,9 +65,13 @@ export const createOrderSchema = z
             package_size: z.enum(['kecil', 'sedang', 'besar']).optional(),
             package_weight: z.string().optional(),
             package_protection: z.enum(['silver', 'gold']).optional(),
+
+            // 🆕 Kode terima paket (khusus type 'send').
+            // true (default)  → generate send_code + biaya Rp2.000
+            // false           → tidak ada kode, tanpa biaya
+            use_send_code: z.boolean().optional().default(true),
         }),
     })
-    // bank_transfer wajib bank_code
     .refine(
         (data) => {
             if (data.body.payment_method === 'bank_transfer') {
@@ -86,7 +84,6 @@ export const createOrderSchema = z
             path: ['body', 'bank_code'],
         }
     )
-    // food wajib punya merchant_id dan minimal 1 item
     .refine(
         (data) =>
             data.body.type !== 'food' ||
@@ -96,7 +93,6 @@ export const createOrderSchema = z
             path: ['body', 'merchant_id'],
         }
     )
-    // jastip wajib punya items + item_budget, dan tiap item punya nama & est_price
     .refine(
         (data) => {
             if (data.body.type !== 'jastip') return true;

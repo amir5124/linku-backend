@@ -36,10 +36,13 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 };
 
 // ── Jastip ──
-const JASTIP_DEFAULT_TARIFF = 'ujastip';
+const JASTIP_DEFAULT_TARIFF = 'warjastip';
 const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
 const MAX_JASTIP_ITEMS = 30;
 const VA_MIN_AMOUNT = 10_000; // minimal transfer bank (VA) LinkQu
+
+// 🆕 Biaya kode terima paket (khusus send). Harus sama dengan frontend.
+const RECEIVE_CODE_FEE = 2_000;
 
 // Jastip TUNAI (customer bayar ke driver saat antar). Semua bisa diubah di tabel
 // `app_settings` tanpa deploy ulang:
@@ -161,10 +164,7 @@ function haversineKm(
 const rp = (n: number) => `Rp${Number(n).toLocaleString('id-ID')}`;
 
 // ============================================================
-// ✅ [BARU] HELPER: Validasi toko buka & verified
-// Dipakai di create() & merchantRespond() supaya order yang
-// masuk ke toko yang sedang TUTUP selalu ditolak di server,
-// bukan cuma di UI aplikasi.
+// ✅ HELPER: Validasi toko buka & verified
 // ============================================================
 async function assertMerchantOpen(
     merchantId: string,
@@ -229,6 +229,7 @@ export const orderService = {
             type: input.type,
             tariffCode: input.tariff_code,
             paymentMethod: input.payment_method,
+            useSendCode: input.use_send_code,
         });
 
         const reportedKm = Number(input.distance_km);
@@ -336,6 +337,21 @@ export const orderService = {
             distanceKm,
         });
 
+        // 🆕 Kode terima paket (khusus send).
+        // Fee ditambahkan di backend supaya orders.total_fare konsisten,
+        // tidak bergantung pada harga kiriman frontend.
+        const useSendCode =
+            input.type === 'send' && input.use_send_code !== false;
+
+        if (input.type === 'send' && useSendCode) {
+            delivery_fee += RECEIVE_CODE_FEE;
+            driver_earning += RECEIVE_CODE_FEE;
+            logger.info('[order.create] Fee kode terima ditambahkan', {
+                fee: RECEIVE_CODE_FEE,
+                delivery_fee,
+            });
+        }
+
         let subtotal = 0;
         let packaging_fee = 0;
         let validatedItems: OrderItemInput[] = [];
@@ -349,7 +365,7 @@ export const orderService = {
             }
 
             // ============================================================
-            // ✅ [BARU] VALIDASI: toko buka & verified
+            // ✅ VALIDASI: toko buka & verified
             // ============================================================
             await assertMerchantOpen(String(input.merchant_id), 'order.create');
 
@@ -561,8 +577,9 @@ export const orderService = {
             }
         }
 
+        // 🆕 send_code hanya di-generate kalau customer mengaktifkan kode terima
         let sendCode: string | null = null;
-        if (input.type === 'send') {
+        if (input.type === 'send' && useSendCode) {
             const { data: codeData, error: codeErr } = await supabaseAdmin.rpc(
                 'generate_send_code'
             );
@@ -576,6 +593,8 @@ export const orderService = {
                 sendCode = codeData as string;
             }
             logger.info('[order.create] send_code', { sendCode });
+        } else if (input.type === 'send') {
+            logger.info('[order.create] send tanpa kode (use_send_code=false)');
         }
 
         const { data: setting } = await supabaseAdmin
@@ -917,10 +936,7 @@ export const orderService = {
             throw ApiError.conflict('Pesanan sudah direspons');
         }
 
-        // ============================================================
-        // ✅ [BARU] VALIDASI: toko masih buka saat terima pesanan
-        // (mencegah toko terima order padahal sudah tutup)
-        // ============================================================
+        // ✅ VALIDASI: toko masih buka saat terima pesanan
         if (accept) {
             await assertMerchantOpen(merchantId, 'order.merchantRespond');
 
@@ -1282,6 +1298,9 @@ export const orderService = {
             accept_expires_at: order.accept_expires_at ?? null,
             item_budget: String(order.item_budget ?? 0),
             jastip_shop_note: order.jastip_shop_note ?? '',
+            // 🆕 Boolean flag — JANGAN kirim nilai kode asli ke driver.
+            // Driver hanya perlu tahu apakah perlu minta kode ke penerima.
+            has_send_code: order.type === 'send' ? !!order.send_code : false,
         };
 
         const driverCopyBase = {
@@ -1385,15 +1404,57 @@ export const orderService = {
             );
     },
 
-    flagRefundIfPaid(order: any) {
-        if (order?.payment_status === 'paid' && order.payment_method !== 'cash') {
-            logger.error('[order] PERLU REFUND — order dibatalkan setelah dibayar', {
+    /**
+     * Kembalikan dana order yang SUDAH dibayar non-tunai (wallet / QRIS / VA)
+     * ke saldo wallet customer. Idempotent (aman dipanggil berulang):
+     * logikanya ada di walletService.refundOrder (klaim atomik orders.refunded_at + wallet_transactions).
+     * Tidak pernah melempar error; kegagalan dicatat agar bisa dicoba ulang oleh sweeper.
+     * Return: jumlah yang dikembalikan (0 = tidak ada yang perlu / sudah pernah).
+     */
+    async refundIfPaid(order: any): Promise<number> {
+        if (!order?.id) return 0;
+        if (order.payment_status !== 'paid' || order.payment_method === 'cash') return 0;
+
+        try {
+            const { walletService } = await import('../wallet/wallet.service');
+            const { amount } = await walletService.refundOrder({ id: order.id });
+
+            if (amount > 0) {
+                logger.info('[order] ✅ Refund ke saldo wallet', {
+                    orderId: order.id,
+                    method: order.payment_method,
+                    amount,
+                    customerId: order.customer_id,
+                });
+
+                await notificationService
+                    .sendToUser(order.customer_id, {
+                        title: 'Dana dikembalikan 💸',
+                        body: `${rp(amount)} sudah kembali ke saldo Wallet kamu.`,
+                        data: {
+                            order_id: String(order.id),
+                            type: 'order_refunded',
+                            service: order.type ?? '',
+                        },
+                    })
+                    .catch(() => { });
+            }
+            return amount;
+        } catch (err: any) {
+            logger.error('[order] REFUND GAGAL — akan dicoba ulang / cek manual', {
                 orderId: order.id,
                 method: order.payment_method,
                 amount: order.total_fare,
                 customerId: order.customer_id,
+                error: err?.message,
             });
+            return 0;
         }
+    },
+
+    /** Nama lama dipertahankan agar semua pemanggil (timeout, toko menolak, updateStatus) otomatis refund. */
+    flagRefundIfPaid(order: any) {
+        void orderService.refundIfPaid(order);
     },
 
     // ============================================================
@@ -1745,7 +1806,21 @@ export const orderService = {
         });
 
         if (status === 'cancelled') {
-            orderService.flagRefundIfPaid(order);
+            // Refund otomatis hanya bila driver belum mulai bekerja
+            // (belum ada driver, atau baru menerima). Setelah itu → tinjau manual,
+            // karena bisa ada biaya / belanjaan yang sudah dibeli.
+            const autoRefund = !order.driver_id || order.status === 'accepted';
+            if (autoRefund) {
+                orderService.flagRefundIfPaid(order);
+            } else if (order.payment_status === 'paid' && order.payment_method !== 'cash') {
+                logger.warn('[order] Dibatalkan setelah driver berjalan — refund perlu ditinjau manual', {
+                    orderId,
+                    fromStatus: order.status,
+                    method: order.payment_method,
+                    amount: order.total_fare,
+                    customerId: order.customer_id,
+                });
+            }
         }
 
         if (
@@ -2240,6 +2315,10 @@ export const orderService = {
             customer,
             driver,
             merchant: merchantRes.data,
+            // 🆕 Ekspos flag boolean ke client (tanpa membocorkan nilai kode asli ke driver).
+            // Customer & admin tetap bisa melihat send_code via field `send_code` di atas.
+            has_send_code:
+                order.type === 'send' ? !!order.send_code : false,
         };
     },
 
@@ -2364,8 +2443,18 @@ export const orderService = {
         if (order.type !== 'send') {
             throw ApiError.badRequest('Foto paket hanya untuk order send');
         }
-        if (order.status !== 'accepted' && order.status !== 'arrived') {
-            throw ApiError.badRequest(
+
+        // 🔧 FIX: flow baru accepted → arrived → in_progress → completed.
+        // `in_progress` wajib diizinkan karena upload foto terjadi setelah
+        // driver konfirmasi jemput paket (status = in_progress).
+        const UPLOAD_ALLOWED_STATUS = ['accepted', 'arrived', 'in_progress'];
+        if (!UPLOAD_ALLOWED_STATUS.includes(order.status)) {
+            logger.warn('[order.uploadPhoto] Status tidak mengizinkan upload', {
+                orderId,
+                status: order.status,
+                allowed: UPLOAD_ALLOWED_STATUS,
+            });
+            throw ApiError.conflict(
                 'Foto paket hanya bisa diupload saat order aktif'
             );
         }

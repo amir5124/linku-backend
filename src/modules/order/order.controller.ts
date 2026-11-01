@@ -51,7 +51,8 @@ export const orderController = {
     updateStatus: asyncHandler(async (req: Request, res: Response) => {
         const orderId = Number(req.params.id);
 
-        // Validasi send_code sebelum completed
+        // 🔧 FIX: verifikasi send_code hanya kalau order memang punya kode.
+        // Order send dengan use_send_code=false → send_code NULL → tidak divalidasi.
         if (req.body.status === 'completed') {
             const order = await orderService.getById(
                 orderId,
@@ -60,9 +61,31 @@ export const orderController = {
             );
 
             if (order.type === 'send' && order.send_code) {
-                if (req.body.send_code !== order.send_code) {
-                    throw ApiError.badRequest('Kode terima paket tidak cocok');
+                const inputCode = String(req.body.send_code ?? '')
+                    .trim()
+                    .toUpperCase();
+                const storedCode = String(order.send_code)
+                    .trim()
+                    .toUpperCase();
+
+                console.log('[order.updateStatus] Verifikasi send_code', {
+                    orderId,
+                    inputLen: inputCode.length,
+                    storedLen: storedCode.length,
+                    match: inputCode === storedCode,
+                });
+
+                if (!inputCode || inputCode !== storedCode) {
+                    throw ApiError.badRequest(
+                        'Kode terima paket tidak cocok'
+                    );
                 }
+            } else if (order.type === 'send') {
+                // Order send tanpa kode — tidak perlu validasi apa pun
+                console.log(
+                    '[order.updateStatus] send tanpa kode, skip verifikasi',
+                    { orderId }
+                );
             }
         }
 

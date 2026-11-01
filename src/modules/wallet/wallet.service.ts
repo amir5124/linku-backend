@@ -10,12 +10,21 @@ import { merchantWalletService } from './merchant-wallet.service';
 // ============================================================
 // KONFIGURASI LINKQU
 // ============================================================
+// const LINKQU_CONFIG = {
+//     clientId: process.env.LINKQU_CLIENT_ID ?? '5f5aa496-7e16-4ca1-9967-33c768dac6c7',
+//     clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'TM1rVhfaFm5YJxKruHo0nWMWC',
+//     username: process.env.LINKQU_USERNAME ?? 'LI9019VKS',
+//     pin: process.env.LINKQU_PIN ?? '5m6uYAScSxQtCmU',
+//     serverKey: process.env.LINKQU_SERVER_KEY ?? 'QtwGEr997XDcmMb1Pq8S5X1N',
+//     baseUrl: process.env.LINKQU_BASE_URL ?? 'https://api.linkqu.id/linkqu-partner',
+// };
+
 const LINKQU_CONFIG = {
-    clientId: process.env.LINKQU_CLIENT_ID ?? '5f5aa496-7e16-4ca1-9967-33c768dac6c7',
-    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'TM1rVhfaFm5YJxKruHo0nWMWC',
-    username: process.env.LINKQU_USERNAME ?? 'LI9019VKS',
-    pin: process.env.LINKQU_PIN ?? '5m6uYAScSxQtCmU',
-    serverKey: process.env.LINKQU_SERVER_KEY ?? 'QtwGEr997XDcmMb1Pq8S5X1N',
+    clientId: process.env.LINKQU_CLIENT_ID ?? 'fdf1a7d7-076c-4430-80f6-95ea4a37ed7a',
+    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'WqbK9mSyehyenvy9zY6MNtM1s',
+    username: process.env.LINKQU_USERNAME ?? 'LI153QRSA',
+    pin: process.env.LINKQU_PIN ?? 'GFGICTz4xnPRGil',
+    serverKey: process.env.LINKQU_SERVER_KEY ?? 'WqbK9mSyehyenvy9zY6MNtM1s',
     baseUrl: process.env.LINKQU_BASE_URL ?? 'https://api.linkqu.id/linkqu-partner',
 };
 
@@ -23,7 +32,7 @@ const LINKQU_CONFIG = {
 // LinkU — callback pembayaran & email default (bisa dioverride via env)
 // ============================================================
 const LINKQU_CALLBACK_URL =
-    process.env.LINKQU_CALLBACK_URL ?? 'https://linku.siappgo.id/api/wallet/callback';
+    process.env.LINKQU_CALLBACK_URL ?? 'https://warung.siappgo.id/api/wallet/callback';
 const DEFAULT_CUSTOMER_EMAIL =
     process.env.DEFAULT_CUSTOMER_EMAIL ?? 'noreply@siappgo.id';
 
@@ -2175,6 +2184,86 @@ class WalletService {
         });
 
         return { new_balance: newBalance, amount };
+    }
+
+    // ============================================================
+    // REFUND ORDER BATAL → saldo wallet customer
+    //
+    // Untuk order yang sudah dibayar non-tunai (wallet / QRIS / VA) lalu
+    // dibatalkan (tidak ada driver, toko menolak/diam, customer batal).
+    // QRIS/VA dikembalikan ke saldo wallet, bukan ke rekening asal.
+    //
+    // Aman dipanggil berkali-kali: orders.refunded_at diklaim secara atomik,
+    // sama seperti refundWithdrawal. Mutasi tercatat di wallet_transactions
+    // (type 'refund', reference ORDER-<id>) lewat mutateCustomer.
+    // Dompet merchant tidak perlu diubah: komisi/pendapatan toko baru
+    // di-settle saat order completed.
+    // ============================================================
+    async refundOrder(order: { id: number }): Promise<{ refunded: boolean; amount: number }> {
+        // Baca data terbaru dari database, jangan percaya objek dari pemanggil
+        const { data: o, error: rErr } = await supabaseAdmin
+            .from('orders')
+            .select('id, customer_id, status, payment_status, payment_method, total_fare, refunded_at')
+            .eq('id', order.id)
+            .maybeSingle();
+        if (rErr) throw ApiError.internal(`Gagal baca order untuk refund: ${rErr.message}`);
+        if (!o) return { refunded: false, amount: 0 };
+
+        if (o.status !== 'cancelled') return { refunded: false, amount: 0 };
+        if (o.payment_status !== 'paid' || o.payment_method === 'cash') {
+            return { refunded: false, amount: 0 };
+        }
+        if (o.refunded_at) return { refunded: false, amount: 0 };
+
+        const amount = Number(o.total_fare ?? 0);
+        if (!(amount > 0)) return { refunded: false, amount: 0 };
+
+        // Klaim atomik — hanya satu proses yang boleh refund
+        const { data: claimed, error: cErr } = await supabaseAdmin
+            .from('orders')
+            .update({ refunded_at: new Date().toISOString(), refund_amount: amount })
+            .eq('id', o.id)
+            .is('refunded_at', null)
+            .select('id');
+        if (cErr) throw ApiError.internal(`Klaim refund order gagal: ${cErr.message}`);
+        if (!claimed || claimed.length === 0) {
+            logger.info('ℹ️ Order sudah direfund, skip', { orderId: o.id });
+            return { refunded: false, amount: 0 };
+        }
+
+        try {
+            await this.mutateCustomer(o.customer_id, (balance) => {
+                const newBalance = balance + amount;
+                return {
+                    newBalance,
+                    tx: {
+                        type: 'refund',
+                        amount,
+                        reference_id: `ORDER-${o.id}`,
+                        description: `Refund pesanan #${o.id} dibatalkan`,
+                    },
+                    result: { newBalance },
+                };
+            });
+        } catch (err: any) {
+            // Saldo belum kembali → lepas klaim supaya bisa dicoba lagi (sweeper)
+            await supabaseAdmin
+                .from('orders')
+                .update({ refunded_at: null, refund_amount: null })
+                .eq('id', o.id);
+            logger.error('Refund order gagal, klaim dilepas', {
+                orderId: o.id,
+                error: err?.message ?? err,
+            });
+            throw err;
+        }
+
+        logger.info('✅ Order direfund ke saldo wallet', {
+            orderId: o.id,
+            customerId: o.customer_id,
+            amount,
+        });
+        return { refunded: true, amount };
     }
     // ============================================================
     // SAVED ACCOUNTS

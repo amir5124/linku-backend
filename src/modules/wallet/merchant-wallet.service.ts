@@ -317,11 +317,49 @@ class MerchantWalletService {
 
                     if (isCash) {
                         // ── CASH: uang sudah di tangan toko. Komisi ditagih ke toko.
-                        // Potong saldo dulu; kekurangannya jadi utang.
-                        const fromBalance = Math.min(balance, commission);
+                        // Urutan: (1) lunasi utang lama dari saldo, (2) komisi order ini
+                        // dari saldo, (3) kekurangannya jadi utang baru.
+                        const debtPaid = Math.min(Math.max(balance, 0), debt);
+                        const bal1 = balance - debtPaid;
+                        const debt1 = debt - debtPaid;
+                        const fromBalance = Math.min(Math.max(bal1, 0), commission);
                         const toDebt = commission - fromBalance;
-                        const newBalance = balance - fromBalance;
-                        const newDebt = debt + toDebt;
+                        const newBalance = bal1 - fromBalance;
+                        const newDebt = debt1 + toDebt;
+
+                        const cashLedger: LedgerDraft[] = [];
+                        if (debtPaid > 0) {
+                            cashLedger.push({
+                                entry_type: 'debt_payment',
+                                amount: debtPaid,
+                                direction: 'out',
+                                balance_after: bal1,
+                                cash_debt_after: debt1,
+                                description: `Pelunasan utang komisi dari saldo (order #${orderId})`,
+                                metadata: {
+                                    debt_paid: debtPaid,
+                                    source: 'balance_cash_order',
+                                    order_id: orderId,
+                                },
+                            });
+                        }
+                        cashLedger.push({
+                            entry_type: 'commission_cash',
+                            amount: commission,
+                            direction: 'out',
+                            balance_after: newBalance,
+                            cash_debt_after: newDebt,
+                            description: `Komisi order #${orderId} (${(rate * 100).toFixed(1)}%)`,
+                            metadata: {
+                                payment_method: 'cash',
+                                commission_base: gross,
+                                commission_rate: rate,
+                                commission_amount: commission,
+                                from_balance: fromBalance,
+                                to_debt: toDebt,
+                                merchant_earning: earning,
+                            },
+                        });
 
                         return {
                             patch: {
@@ -329,33 +367,15 @@ class MerchantWalletService {
                                 cash_debt: newDebt,
                                 total_earning: Number(w.total_earning) + earning,
                                 total_commission_paid:
-                                    Number(w.total_commission_paid) + fromBalance,
+                                    Number(w.total_commission_paid) + fromBalance + debtPaid,
                                 total_commission_owed: newDebt,
                             },
-                            ledger: [
-                                {
-                                    entry_type: 'commission_cash',
-                                    amount: commission,
-                                    direction: 'out',
-                                    balance_after: newBalance,
-                                    cash_debt_after: newDebt,
-                                    description: `Komisi order #${orderId} (${(rate * 100).toFixed(1)}%)`,
-                                    metadata: {
-                                        payment_method: 'cash',
-                                        commission_base: gross,
-                                        commission_rate: rate,
-                                        commission_amount: commission,
-                                        from_balance: fromBalance,
-                                        to_debt: toDebt,
-                                        merchant_earning: earning,
-                                    },
-                                },
-                            ],
+                            ledger: cashLedger,
                             result: {
                                 balance: newBalance,
                                 cash_debt: newDebt,
                                 to_debt: toDebt,
-                                debt_paid: 0,
+                                debt_paid: debtPaid,
                             },
                         };
                     }
