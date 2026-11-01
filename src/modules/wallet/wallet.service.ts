@@ -20,11 +20,11 @@ import { merchantWalletService } from './merchant-wallet.service';
 // };
 
 const LINKQU_CONFIG = {
-    clientId: process.env.LINKQU_CLIENT_ID ?? 'fdf1a7d7-076c-4430-80f6-95ea4a37ed7a',
-    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'WqbK9mSyehyenvy9zY6MNtM1s',
-    username: process.env.LINKQU_USERNAME ?? 'LI153QRSA',
-    pin: process.env.LINKQU_PIN ?? 'GFGICTz4xnPRGil',
-    serverKey: process.env.LINKQU_SERVER_KEY ?? 'WqbK9mSyehyenvy9zY6MNtM1s',
+    clientId: process.env.LINKQU_CLIENT_ID ?? '5f5aa496-7e16-4ca1-9967-33c768dac6c7',
+    clientSecret: process.env.LINKQU_CLIENT_SECRET ?? 'TM1rVhfaFm5YJxKruHo0nWMWC',
+    username: process.env.LINKQU_USERNAME ?? 'LI9019VKS',
+    pin: process.env.LINKQU_PIN ?? '5m6uYAScSxQtCmU',
+    serverKey: process.env.LINKQU_SERVER_KEY ?? 'QtwGEr997XDcmMb1Pq8S5X1N',
     baseUrl: process.env.LINKQU_BASE_URL ?? 'https://api.linkqu.id/linkqu-partner',
 };
 
@@ -32,7 +32,7 @@ const LINKQU_CONFIG = {
 // LinkU — callback pembayaran & email default (bisa dioverride via env)
 // ============================================================
 const LINKQU_CALLBACK_URL =
-    process.env.LINKQU_CALLBACK_URL ?? 'https://warung.siappgo.id/api/wallet/callback';
+    process.env.LINKQU_CALLBACK_URL ?? 'https://linku.siappgo.id/api/wallet/callback';
 const DEFAULT_CUSTOMER_EMAIL =
     process.env.DEFAULT_CUSTOMER_EMAIL ?? 'noreply@siappgo.id';
 
