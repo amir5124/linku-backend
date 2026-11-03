@@ -3,6 +3,7 @@ import { supabaseAdmin } from '../../config/supabase';
 import { logger } from '../../config/logger';
 import { notificationService } from '../notification/notification.service';
 import { orderService } from './order.service';
+import { adminOrderNotify } from './order-admin-notify';
 
 // ═══════════════════════════════════════════════════════════════
 // KONSTANTA TIMEOUT
@@ -132,6 +133,9 @@ export const orderTimeoutService = {
                 }
                 if (!updated) continue; // sudah bukan pending
 
+                // Kabari admin (order dibatalkan otomatis karena tanpa driver)
+                void adminOrderNotify.autoCancelled(order, 'no_driver');
+
                 // Tandai refund bila sudah dibayar
                 orderService.flagRefundIfPaid(order);
 
@@ -237,6 +241,9 @@ export const orderTimeoutService = {
                     continue;
                 }
                 if (!updated) continue;
+
+                // Kabari admin (pembayaran kedaluwarsa)
+                void adminOrderNotify.autoCancelled(order, 'payment_timeout');
 
                 await supabaseAdmin
                     .from('order_payments')

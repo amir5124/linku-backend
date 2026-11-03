@@ -6,6 +6,7 @@ import { notificationService } from '../notification/notification.service';
 import { merchantWalletService } from '../wallet/merchant-wallet.service';
 import { logger } from '../../config/logger';
 import { assertDriverCanAccept } from './driver-eligibility';
+import { adminOrderNotify } from './order-admin-notify';
 
 import {
     kindOf,
@@ -36,7 +37,7 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 };
 
 // ── Jastip ──
-const JASTIP_DEFAULT_TARIFF = 'warjastip';
+const JASTIP_DEFAULT_TARIFF = 'ujastip';
 const MAX_JASTIP_BUDGET = 500_000; // jastip prabayar (bisa diubah via settings)
 const MAX_JASTIP_ITEMS = 30;
 const VA_MIN_AMOUNT = 10_000; // minimal transfer bank (VA) LinkQu
@@ -760,6 +761,11 @@ export const orderService = {
                     })
                     .eq('id', order.id);
 
+                void adminOrderNotify.orderFailed(
+                    order,
+                    `Pembayaran saldo gagal: ${err.message}`
+                );
+
                 throw ApiError.internal('Gagal potong saldo: ' + err.message);
             }
         } else if (
@@ -800,6 +806,8 @@ export const orderService = {
                     reference: payment.partner_reff,
                 });
 
+                void adminOrderNotify.newOrder(order);
+
                 return await orderService.getById(order.id, customerId, 'customer');
             } catch (err: any) {
                 logger.error('[order.create] ❌ Payment link gagal', {
@@ -816,9 +824,16 @@ export const orderService = {
                     })
                     .eq('id', order.id);
 
+                void adminOrderNotify.orderFailed(
+                    order,
+                    `Pembuatan pembayaran gagal: ${err.message}`
+                );
+
                 throw ApiError.internal('Gagal buat payment: ' + err.message);
             }
         }
+
+        void adminOrderNotify.newOrder(order);
 
         await orderService.onOrderReady(order, {
             pickup: {
@@ -980,6 +995,8 @@ export const orderService = {
             accept,
             prep: opts.prep_minutes,
         });
+
+        void adminOrderNotify.merchantResponded(order, accept, opts);
 
         if (accept) {
             await notificationService
@@ -1171,6 +1188,8 @@ export const orderService = {
         });
 
         if (drivers.length === 0) {
+            void adminOrderNotify.noDriver(order);
+
             try {
                 const searching = searchingForCustomer(kind);
                 await notificationService.sendToUser(order.customer_id, {
@@ -1313,6 +1332,10 @@ export const orderService = {
         };
 
         if (autobidDriver) {
+            void adminOrderNotify.driverAssigned(order, autobidDriver, {
+                autobid: true,
+            });
+
             const driverCopy = newOrderForDriver({ ...driverCopyBase, autobid: true });
 
             await notificationService
@@ -1448,6 +1471,7 @@ export const orderService = {
                 customerId: order.customer_id,
                 error: err?.message,
             });
+            void adminOrderNotify.refundFailed(order, err?.message);
             return 0;
         }
     },
@@ -1623,6 +1647,8 @@ export const orderService = {
             firstName(driverProfile?.full_name)
         );
 
+        void adminOrderNotify.driverAssigned(order, driverId);
+
         return data;
     },
 
@@ -1653,6 +1679,8 @@ export const orderService = {
             });
             return;
         }
+
+        void adminOrderNotify.paymentPaid(order);
 
         await orderService.onOrderReady(order);
         logger.info('[order.triggerMatching] ✅ DONE', { orderId });
@@ -1820,6 +1848,7 @@ export const orderService = {
                     amount: order.total_fare,
                     customerId: order.customer_id,
                 });
+                void adminOrderNotify.refundReview(order);
             }
         }
 
@@ -1882,6 +1911,7 @@ export const orderService = {
                     driverId: order.driver_id,
                     error: err.message,
                 });
+                void adminOrderNotify.settleFailed(order, err.message);
             }
         }
 
@@ -1963,6 +1993,13 @@ export const orderService = {
                 });
             }
         }
+
+        // Kabari semua admin atas perubahan status ini
+        void adminOrderNotify.statusChanged(order, status, {
+            actorId: userId,
+            actorRole: sender?.role ?? role,
+            reason: reason ?? null,
+        });
 
         return data;
     },
@@ -2178,6 +2215,9 @@ export const orderService = {
                         refund,
                         error: refErr.message,
                     });
+                    void adminOrderNotify.refundFailed(order, refErr.message, {
+                        amount: refund,
+                    });
                 }
             }
         }
@@ -2205,6 +2245,16 @@ export const orderService = {
             refund,
             noReceipt,
         });
+
+        void adminOrderNotify.purchaseConfirmed(order, {
+            actualTotal,
+            budget,
+            refund,
+            noReceipt,
+            noReceiptNote,
+            isCash: isCashOrder,
+        });
+
         return updated;
     },
 

@@ -21,6 +21,7 @@ const router = Router();
 
 router.use(requireAuth);
 router.put('/me', profileController.update);
+router.delete('/push-token', profileController.removePushToken);
 router.get('/:id', profileController.getById);
 router.post(
     '/avatar',

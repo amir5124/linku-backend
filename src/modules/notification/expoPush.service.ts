@@ -4,6 +4,11 @@ import { env } from '../../config/env';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
+// Expo membatasi maksimal 100 message per request
+const CHUNK_SIZE = 100;
+// Jangan biarkan request ke Expo menggantung (pengiriman push di-await di alur order)
+const REQUEST_TIMEOUT_MS = 15_000;
+
 export interface ExpoPushMessage {
     to: string;
     title: string;
@@ -22,63 +27,107 @@ export interface ExpoPushTicket {
     details?: Record<string, any>;
 }
 
+const isExpoToken = (to?: string) =>
+    !!to && (to.startsWith('ExponentPushToken[') || to.startsWith('ExpoPushToken['));
+
 export const expoPushService = {
     /**
-     * Kirim 1 atau banyak push dalam satu request.
-     * Expo membatasi maksimal 100 message per request.
+     * Kirim 1 atau banyak push. Pesan dipecah per 100 per request.
+     *
+     * Hasil: `{ data: tickets }` (bentuk sama dengan respons Expo), dengan
+     * `tickets` SELALU sejajar 1:1 dengan urutan pesan yang dikirim: pesan ke-i
+     * punya tiket ke-i. Pesan yang tidak dikirim (token tidak valid, request
+     * gagal) mendapat tiket berstatus 'error' sehingga urutan tidak bergeser.
+     * Mengembalikan null kalau tidak ada satu pun pesan yang sampai ke Expo.
      */
-    async send(messages: ExpoPushMessage | ExpoPushMessage[]) {
+    async send(
+        messages: ExpoPushMessage | ExpoPushMessage[]
+    ): Promise<{ data: ExpoPushTicket[] } | null> {
         const payload = Array.isArray(messages) ? messages : [messages];
+        if (payload.length === 0) return null;
 
-        // Filter token yang jelas tidak valid
-        const valid = payload.filter((m) => {
-            if (!m.to) return false;
-            if (!m.to.startsWith('ExponentPushToken[') && !m.to.startsWith('ExpoPushToken[')) {
+        // Tiket awal: semua dianggap belum terkirim
+        const tickets: ExpoPushTicket[] = payload.map(() => ({
+            status: 'error',
+            message: 'Tidak ada tiket dari Expo',
+            details: { error: 'NoTicket' },
+        }));
+
+        // Index pesan yang formatnya valid
+        const sendable: number[] = [];
+        payload.forEach((m, i) => {
+            if (isExpoToken(m.to)) {
+                sendable.push(i);
+            } else {
                 logger.warn('Token bukan format Expo Push', { token: m.to });
-                return false;
+                tickets[i] = {
+                    status: 'error',
+                    message: 'Format token bukan Expo Push',
+                    details: { error: 'InvalidToken' },
+                };
             }
-            return true;
         });
 
-        if (valid.length === 0) return null;
+        if (sendable.length === 0) return null;
 
-        try {
-            const { data } = await axios.post(EXPO_PUSH_URL, valid, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    Accept: 'application/json',
-                    'Accept-Encoding': 'gzip, deflate',
-                    ...(env.expoAccessToken
-                        ? { Authorization: `Bearer ${env.expoAccessToken}` }
-                        : {}),
-                },
-            });
+        const headers = {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+            ...(env.expoAccessToken
+                ? { Authorization: `Bearer ${env.expoAccessToken}` }
+                : {}),
+        };
 
-            // data.data berisi array ticket untuk tiap message
-            const tickets: ExpoPushTicket[] = Array.isArray(data?.data)
-                ? data.data
-                : data?.data
-                    ? [data.data]
-                    : [];
+        let anySent = false;
 
-            // Log error ticket
-            tickets.forEach((t, i) => {
-                if (t.status === 'error') {
-                    logger.warn('Expo push error ticket', {
-                        to: valid[i]?.to,
-                        message: t.message,
-                        details: t.details,
-                    });
-                }
-            });
+        for (let start = 0; start < sendable.length; start += CHUNK_SIZE) {
+            const idxs = sendable.slice(start, start + CHUNK_SIZE);
+            const chunk = idxs.map((i) => payload[i]);
 
-            return data;
-        } catch (err: any) {
-            logger.error('Expo push request failed', {
-                message: err.message,
-                response: err.response?.data,
-            });
-            return null;
+            try {
+                const { data } = await axios.post(EXPO_PUSH_URL, chunk, {
+                    headers,
+                    timeout: REQUEST_TIMEOUT_MS,
+                });
+
+                // data.data berisi array ticket untuk tiap message
+                const res: ExpoPushTicket[] = Array.isArray(data?.data)
+                    ? data.data
+                    : data?.data
+                        ? [data.data]
+                        : [];
+
+                idxs.forEach((payloadIdx, k) => {
+                    const t = res[k];
+                    if (!t) return; // tetap memakai tiket awal (NoTicket)
+                    tickets[payloadIdx] = t;
+
+                    if (t.status === 'error') {
+                        logger.warn('Expo push error ticket', {
+                            to: payload[payloadIdx]?.to,
+                            message: t.message,
+                            details: t.details,
+                        });
+                    }
+                });
+
+                anySent = true;
+            } catch (err: any) {
+                logger.error('Expo push request failed', {
+                    message: err.message,
+                    response: err.response?.data,
+                });
+                idxs.forEach((payloadIdx) => {
+                    tickets[payloadIdx] = {
+                        status: 'error',
+                        message: err.message,
+                        details: { error: 'RequestFailed' },
+                    };
+                });
+            }
         }
+
+        return anySent ? { data: tickets } : null;
     },
 };
