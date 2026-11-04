@@ -20,10 +20,11 @@ import adminRoutes from './modules/admin/admin.routes';
 import profileRoutes from './modules/profile/profile.routes';
 import savedAddressRoutes from './modules/saved-address/saved-address.routes';
 import tariffRoutes from './modules/tariff/tariff.routes';
+import regionRoutes from './modules/region/region.routes'; // ← TAMBAH INI
 import ratingRoutes from './modules/rating/rating.routes';
 import activityRoutes from './modules/activity/activity.routes';
 import walletRoutes from './modules/wallet/wallet.routes';
-import walletCallbackRouter from './modules/wallet/wallet.callback';  // ← TAMBAH INI
+import walletCallbackRouter from './modules/wallet/wallet.callback';
 import merchantRouter from './modules/merchant/merchant.routes';
 import uploadRoutes from './modules/upload/upload.routes';
 import settingsRouter from './modules/settings/settings.routes';
@@ -58,6 +59,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/saved-addresses', savedAddressRoutes);
 app.use('/api/tariffs', tariffRoutes);
+app.use('/api/regions', regionRoutes); // ← TAMBAH INI (publik: GET /, customer: /me, admin: /admin/*)
 app.use('/api/ratings', ratingRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/upload', uploadRoutes);

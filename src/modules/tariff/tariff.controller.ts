@@ -8,7 +8,12 @@ import { ApiError } from '../../utils/ApiError';
 const adminId = (req: Request) => (req as any).user?.id as string | undefined;
 
 export const tariffController = {
-    list: asyncHandler(async (_req: Request, res: Response) => ok(res, await tariffService.list())),
+    // GET /api/tariffs?region_id=3  (region_id opsional; tidak valid → diabaikan)
+    list: asyncHandler(async (req: Request, res: Response) => {
+        const raw = req.query.region_id;
+        const regionId = raw !== undefined && raw !== '' ? Number(raw) : undefined;
+        return ok(res, await tariffService.list(Number.isInteger(regionId) ? regionId : undefined));
+    }),
 
     listAll: asyncHandler(async (_req: Request, res: Response) => ok(res, await tariffService.listAll())),
 

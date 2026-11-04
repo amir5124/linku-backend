@@ -56,14 +56,54 @@ function clean(patch: TariffInput, requireCore: boolean) {
 }
 
 export const tariffService = {
-    async list() {
+    /**
+     * Daftar tarif aktif. Kalau regionId diberikan dan wilayahnya aktif,
+     * nilai min_fare / per_km / base_km ditimpa dengan nilai wilayah itu
+     * (kolom yang tidak diatur di wilayah tetap memakai tarif dasar).
+     * Struktur respons sama persis dengan sebelumnya, jadi aplikasi yang
+     * menghitung harga dari daftar ini tidak perlu mengubah rumusnya.
+     */
+    async list(regionId?: number) {
         const { data, error } = await supabaseAdmin
             .from('tariffs')
             .select('*')
             .eq('is_active', true)
             .order('sort_order');
         if (error) throw ApiError.internal(error.message);
-        return data || [];
+        const tariffs = data || [];
+
+        if (!regionId) return tariffs;
+
+        const { data: region, error: rErr } = await supabaseAdmin
+            .from('regions')
+            .select('id')
+            .eq('id', regionId)
+            .eq('is_active', true)
+            .maybeSingle();
+        if (rErr) throw ApiError.internal(rErr.message);
+        if (!region) return tariffs; // wilayah tidak ada / nonaktif → tarif dasar
+
+        const { data: overrides, error: oErr } = await supabaseAdmin
+            .from('region_tariffs')
+            .select('tariff_code, min_fare, per_km, base_km')
+            .eq('region_id', regionId)
+            .eq('is_active', true);
+        if (oErr) throw ApiError.internal(oErr.message);
+
+        const map = new Map<string, any>((overrides ?? []).map((o: any) => [o.tariff_code, o]));
+
+        return tariffs.map((t: any) => {
+            const o = map.get(t.code);
+            if (!o) return t;
+            return {
+                ...t,
+                min_fare: o.min_fare ?? t.min_fare,
+                per_km: o.per_km ?? t.per_km,
+                base_km: o.base_km ?? t.base_km,
+                region_id: regionId,
+                region_applied: true,
+            };
+        });
     },
 
     async listAll() {
@@ -72,6 +112,26 @@ export const tariffService = {
         return data || [];
     },
 
+    /**
+     * Tarif efektif satu kode tarif untuk sebuah titik: tarif dasar ditimpa
+     * nilai wilayah HANYA kalau titik berada di dalam radius wilayah itu.
+     * Hasil: { code, min_fare, per_km, base_km, region_id, region_applied }.
+     * Dipakai server saat menghitung ongkos order (lihat catatan di calculate).
+     */
+    async getEffective(code: string, regionId?: number | null, lat?: number, lng?: number) {
+        const { data, error } = await supabaseAdmin.rpc('get_effective_tariff', {
+            p_code: code,
+            p_region_id: regionId ?? null,
+            p_lat: lat ?? null,
+            p_lng: lng ?? null,
+        });
+        if (error) throw ApiError.internal(error.message);
+        return Array.isArray(data) ? data[0] : data;
+    },
+
+    // CATATAN: calculate_tariff (RPC) masih memakai tarif dasar. Agar ongkos
+    // yang DITAGIH server ikut tarif wilayah, rumusnya harus memakai hasil
+    // getEffective() — lihat langkah lanjutan di catatan pengiriman.
     async calculate(code: string, distanceKm: number) {
         const { data, error } = await supabaseAdmin.rpc('calculate_tariff', {
             p_code: code,
