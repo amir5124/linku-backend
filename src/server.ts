@@ -29,9 +29,11 @@ import uploadRoutes from './modules/upload/upload.routes';
 import settingsRouter from './modules/settings/settings.routes';
 import publicAssetsRoutes from './modules/assets/public.routes';
 import adminAssetsRoutes from './modules/assets/assets.routes';
+import broadcastRoutes from './modules/broadcast/broadcast.routes';
 
 
 import { orderTimeoutService } from './modules/order/order-timeout.service';
+import { broadcastService } from './modules/broadcast/broadcast.service';
 
 const app = express();
 
@@ -62,6 +64,7 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/settings', settingsRouter);
 app.use('/api/public', publicAssetsRoutes);
 app.use('/api/admin/assets', adminAssetsRoutes);
+app.use('/api/broadcasts', broadcastRoutes);
 
 // ============================================================
 // CALLBACK LINKQU — tanpa auth (didaftarkan DULUAN)
@@ -86,6 +89,15 @@ initSocket(httpServer);
 
 // Cek order pending tiap 1 menit
 orderTimeoutService.start(60_000);
+
+// Tandai broadcast yang tertinggal berstatus 'sending' akibat server restart.
+// Pengiriman broadcast berjalan di dalam proses, jadi baris 'sending' yang
+// ada saat boot pasti sudah mati. (Aman untuk satu instance server.)
+broadcastService
+    .failStuck()
+    .catch((err) =>
+        logger.warn('failStuck broadcast gagal', { err: err?.message })
+    );
 
 httpServer.listen(env.port, () => {
     logger.info(`Server running on port ${env.port}`);
