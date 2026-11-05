@@ -1,3 +1,4 @@
+// src/server.ts
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -14,25 +15,23 @@ import driverRoutes from './modules/driver/driver.routes';
 import merchantRoutes from './modules/merchant/merchant.routes';
 import menuRoutes from './modules/menu/menu.routes';
 import orderRoutes from './modules/order/order.routes';
+import offerRoutes from './modules/offers/offer.routes'; // ← file router, BUKAN offer.service
 import chatRoutes from './modules/chat/chat.routes';
 import notificationRoutes from './modules/notification/notification.routes';
 import adminRoutes from './modules/admin/admin.routes';
 import profileRoutes from './modules/profile/profile.routes';
 import savedAddressRoutes from './modules/saved-address/saved-address.routes';
 import tariffRoutes from './modules/tariff/tariff.routes';
-import regionRoutes from './modules/region/region.routes'; // ← TAMBAH INI
+import regionRoutes from './modules/region/region.routes';
 import ratingRoutes from './modules/rating/rating.routes';
 import activityRoutes from './modules/activity/activity.routes';
 import walletRoutes from './modules/wallet/wallet.routes';
 import walletCallbackRouter from './modules/wallet/wallet.callback';
-import merchantRouter from './modules/merchant/merchant.routes';
 import uploadRoutes from './modules/upload/upload.routes';
 import settingsRouter from './modules/settings/settings.routes';
 import publicAssetsRoutes from './modules/assets/public.routes';
 import adminAssetsRoutes from './modules/assets/assets.routes';
 import broadcastRoutes from './modules/broadcast/broadcast.routes';
-
-
 import { orderTimeoutService } from './modules/order/order-timeout.service';
 import { broadcastService } from './modules/broadcast/broadcast.service';
 
@@ -53,13 +52,22 @@ app.use('/api/profiles', profileRoutes);
 app.use('/api/drivers', driverRoutes);
 app.use('/api/merchants', merchantRoutes);
 app.use('/api/menus', menuRoutes);
+
+// ============================================================
+// ORDERS — urutan penting:
+// offerRoutes (nego) HARUS di depan orderRoutes, supaya
+// /api/orders/offers/config dan /api/orders/:id/offers/* tidak
+// tertangkap route generik /:id milik orderRoutes.
+// ============================================================
+app.use('/api/orders', offerRoutes);
 app.use('/api/orders', orderRoutes);
+
 app.use('/api/chats', chatRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/saved-addresses', savedAddressRoutes);
 app.use('/api/tariffs', tariffRoutes);
-app.use('/api/regions', regionRoutes); // ← TAMBAH INI (publik: GET /, customer: /me, admin: /admin/*)
+app.use('/api/regions', regionRoutes); // publik: GET /, customer: /me, admin: /admin/*
 app.use('/api/ratings', ratingRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/upload', uploadRoutes);
@@ -79,7 +87,8 @@ app.use('/api/wallet', walletCallbackRouter);
 // ============================================================
 app.use('/api/wallet', walletRoutes);
 
-app.use('/api/merchant', merchantRouter);
+// Alias lama untuk merchant (tunggal)
+app.use('/api/merchant', merchantRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
