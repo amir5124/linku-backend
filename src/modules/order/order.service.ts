@@ -217,6 +217,53 @@ type OrderItemInput = {
 };
 
 // ============================================================
+// ✅ HELPER BARU: Region & tarif wilayah
+// ============================================================
+
+async function getCustomerRegionId(customerId: string): Promise<number | null> {
+    try {
+        const { data } = await supabaseAdmin
+            .from('profiles')
+            .select('region_id')
+            .eq('id', customerId)
+            .maybeSingle();
+        return data?.region_id ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/** Ongkos memakai tarif wilayah bila berlaku; kalau gagal, jatuh ke tarif dasar. */
+async function calculateTariffForOrder(p: {
+    code: string;
+    distanceKm: number;
+    regionId: number | null;
+    pickupLat: number;
+    pickupLng: number;
+}) {
+    if (p.regionId) {
+        const { data, error } = await supabaseAdmin.rpc('calculate_tariff_region', {
+            p_code: p.code,
+            p_distance_km: p.distanceKm,
+            p_region_id: p.regionId,
+            p_lat: p.pickupLat,
+            p_lng: p.pickupLng,
+        });
+        if (!error) return { data, error: null };
+        logger.error('[order.create] calculate_tariff_region gagal, memakai tarif dasar', {
+            code: p.code,
+            regionId: p.regionId,
+            error: error.message,
+        });
+    }
+    const res = await supabaseAdmin.rpc('calculate_tariff', {
+        p_code: p.code,
+        p_distance_km: p.distanceKm,
+    });
+    return { data: res.data, error: res.error };
+}
+
+// ============================================================
 // Service
 // ============================================================
 
@@ -272,18 +319,22 @@ export const orderService = {
         let tariffLabel: string | null = null;
 
         if (input.tariff_code) {
-            const { data: t, error: tErr } = await supabaseAdmin.rpc(
-                'calculate_tariff',
-                {
-                    p_code: input.tariff_code,
-                    p_distance_km: distanceKm,
-                }
-            );
+            // ✅ FIX: pakai tarif wilayah bila customer punya region_id,
+            // fallback ke tarif dasar bila calculate_tariff_region gagal.
+            const regionId = await getCustomerRegionId(customerId);
+            const { data: t, error: tErr } = await calculateTariffForOrder({
+                code: input.tariff_code,
+                distanceKm,
+                regionId,
+                pickupLat: Number(input.pickup_lat),
+                pickupLng: Number(input.pickup_lng),
+            });
 
             if (tErr) {
                 logger.error('[order.create] calculate_tariff gagal', {
                     error: tErr.message,
                     code: input.tariff_code,
+                    regionId,
                 });
                 throw ApiError.internal(tErr.message);
             }
