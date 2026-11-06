@@ -18,6 +18,13 @@ const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
 /** Order QRIS/VA belum dibayar → 15 menit */
 const PAYMENT_TIMEOUT_MS = 15 * 60 * 1000;
 
+/**
+ * 🆕 Selama masih ada penawaran nego yang aktif, order tidak dibatalkan
+ * karena "tidak ada driver". Penahanan dibatasi sampai sekian menit sejak
+ * order dibuat, supaya penawaran berulang tidak bisa menahan order tanpa batas.
+ */
+const NEGO_MAX_HOLD_MS = 10 * 60 * 1000;
+
 let intervalRef: ReturnType<typeof setInterval> | null = null;
 
 // ═══════════════════════════════════════════════════════════════
@@ -75,6 +82,9 @@ export const orderTimeoutService = {
     // Untuk food, hitungan mulai dari toko menerima (merchant_responded_at),
     // bukan dari order dibuat. Order yang masih menunggu toko dilewati
     // (ditangani rejectUnansweredMerchantOrders).
+    //
+    // 🆕 Order yang masih punya penawaran nego aktif ditahan (maks NEGO_MAX_HOLD_MS
+    // sejak dibuat), supaya customer sempat menimbang penawaran driver.
     async cancelStalePendingOrders() {
         const cutoffMs = Date.now() - PENDING_TIMEOUT_MS;
         const cutoff = new Date(cutoffMs).toISOString();
@@ -106,11 +116,52 @@ export const orderTimeoutService = {
         });
         if (stale.length === 0) return;
 
+        // 🆕 Tahan order yang masih punya penawaran nego aktif
+        let toCancel: any[] = stale;
+        try {
+            const { data: liveOffers, error: offErr } = await supabaseAdmin
+                .from('order_offers')
+                .select('order_id')
+                .in(
+                    'order_id',
+                    stale.map((o: any) => o.id)
+                )
+                .eq('status', 'pending')
+                .gt('expires_at', new Date().toISOString());
+
+            if (offErr) {
+                // Gagal cek penawaran: jangan menahan order, pakai perilaku lama
+                logger.warn('[orderTimeout] Gagal cek penawaran nego', {
+                    error: offErr.message,
+                });
+            } else {
+                const holding = new Set(
+                    (liveOffers ?? []).map((r: any) => r.order_id)
+                );
+                toCancel = stale.filter(
+                    (o: any) =>
+                        !holding.has(o.id) ||
+                        Date.now() - new Date(o.created_at).getTime() >
+                        NEGO_MAX_HOLD_MS
+                );
+                if (holding.size > 0) {
+                    logger.info('[orderTimeout] Order ditahan (penawaran nego aktif)', {
+                        held: stale.length - toCancel.length,
+                    });
+                }
+            }
+        } catch (err: any) {
+            logger.warn('[orderTimeout] Error cek penawaran nego', {
+                error: err?.message,
+            });
+        }
+        if (toCancel.length === 0) return;
+
         logger.info('[orderTimeout] Auto-cancel order tanpa driver', {
-            count: stale.length,
+            count: toCancel.length,
         });
 
-        for (const order of stale) {
+        for (const order of toCancel) {
             try {
                 const { data: updated, error: updateErr } = await supabaseAdmin
                     .from('orders')
@@ -141,6 +192,16 @@ export const orderTimeoutService = {
 
                 await supabaseAdmin
                     .from('order_bids')
+                    .update({
+                        status: 'expired',
+                        responded_at: new Date().toISOString(),
+                    })
+                    .eq('order_id', order.id)
+                    .eq('status', 'pending');
+
+                // 🆕 Tutup penawaran nego yang masih menggantung
+                await supabaseAdmin
+                    .from('order_offers')
                     .update({
                         status: 'expired',
                         responded_at: new Date().toISOString(),

@@ -1482,6 +1482,102 @@ export const orderService = {
     },
 
     // ============================================================
+    // 🆕 EFEK SETELAH ORDER DITERIMA DRIVER
+    // Dipakai bersama oleh accept() biasa dan penerimaan penawaran (nego):
+    // tandai order_bids, tutup penawaran lain, driver → 'busy',
+    // notif customer / toko / admin.
+    // ============================================================
+    async afterAccepted(
+        order: any,
+        driverId: string,
+        opts: { notifyCustomer?: boolean } = {}
+    ) {
+        const notifyCustomer = opts.notifyCustomer !== false;
+        const nowIso = new Date().toISOString();
+
+        await supabaseAdmin
+            .from('order_bids')
+            .update({ status: 'accepted', responded_at: nowIso })
+            .eq('order_id', order.id)
+            .eq('driver_id', driverId);
+
+        await supabaseAdmin
+            .from('order_bids')
+            .update({ status: 'rejected', responded_at: nowIso })
+            .eq('order_id', order.id)
+            .neq('driver_id', driverId)
+            .eq('status', 'pending');
+
+        // Penawaran nego lain yang masih menggantung ikut ditutup
+        // (kalau ini hasil nego, penawaran pemenang sudah 'accepted' dan tidak tersentuh)
+        await supabaseAdmin
+            .from('order_offers')
+            .update({ status: 'rejected', responded_at: nowIso })
+            .eq('order_id', order.id)
+            .eq('status', 'pending');
+
+        await supabaseAdmin
+            .from('driver_profiles')
+            .update({ status: 'busy' })
+            .eq('user_id', driverId);
+
+        const { data: driverProfile } = await supabaseAdmin
+            .from('profiles')
+            .select('full_name')
+            .eq('id', driverId)
+            .maybeSingle();
+
+        if (notifyCustomer) {
+            const { data: driverVehicle } = await supabaseAdmin
+                .from('driver_profiles')
+                .select('vehicle_brand, plate_number')
+                .eq('user_id', driverId)
+                .maybeSingle();
+
+            const kind = kindOf(order.type);
+            const pickupShort = prettyPlace(order.pickup_name);
+
+            const copy = driverFoundForCustomer({
+                kind,
+                pickup: pickupShort,
+                driverName: driverProfile?.full_name ?? null,
+                vehicle: driverVehicle?.vehicle_brand ?? null,
+                plate: driverVehicle?.plate_number ?? null,
+            });
+
+            try {
+                await notificationService.sendToUser(order.customer_id, {
+                    title: copy.title,
+                    body: copy.body,
+                    data: {
+                        order_id: order.id,
+                        type: 'driver_accepted',
+                        service: order.type,
+                        tariff_code: order.tariff_code,
+                    },
+                });
+
+                logger.info('[order.afterAccepted] Notif customer terkirim', {
+                    orderId: order.id,
+                    driverId,
+                });
+            } catch (err: any) {
+                logger.warn('[order.afterAccepted] Gagal kirim notif ke customer', {
+                    orderId: order.id,
+                    error: err.message,
+                });
+            }
+        }
+
+        await orderService.notifyMerchantDriverAssigned(
+            order,
+            firstName(driverProfile?.full_name)
+        );
+
+        void adminOrderNotify.driverAssigned(order, driverId);
+    },
+
+    // ============================================================
     // ACCEPT ORDER (driver)
     // ============================================================
     async accept(orderId: number, driverId: string) {
@@ -1572,82 +1668,8 @@ export const orderService = {
             type: order.type,
         });
 
-        await supabaseAdmin
-            .from('order_bids')
-            .update({
-                status: 'accepted',
-                responded_at: new Date().toISOString(),
-            })
-            .eq('order_id', orderId)
-            .eq('driver_id', driverId);
-
-        await supabaseAdmin
-            .from('order_bids')
-            .update({
-                status: 'rejected',
-                responded_at: new Date().toISOString(),
-            })
-            .eq('order_id', orderId)
-            .neq('driver_id', driverId)
-            .eq('status', 'pending');
-
-        await supabaseAdmin
-            .from('driver_profiles')
-            .update({ status: 'busy' })
-            .eq('user_id', driverId);
-
-        const { data: driverProfile } = await supabaseAdmin
-            .from('profiles')
-            .select('full_name')
-            .eq('id', driverId)
-            .maybeSingle();
-
-        const { data: driverVehicle } = await supabaseAdmin
-            .from('driver_profiles')
-            .select('vehicle_brand, plate_number')
-            .eq('user_id', driverId)
-            .maybeSingle();
-
-        const kind = kindOf(order.type);
-        const pickupShort = prettyPlace(order.pickup_name);
-
-        const copy = driverFoundForCustomer({
-            kind,
-            pickup: pickupShort,
-            driverName: driverProfile?.full_name ?? null,
-            vehicle: driverVehicle?.vehicle_brand ?? null,
-            plate: driverVehicle?.plate_number ?? null,
-        });
-
-        try {
-            await notificationService.sendToUser(order.customer_id, {
-                title: copy.title,
-                body: copy.body,
-                data: {
-                    order_id: orderId,
-                    type: 'driver_accepted',
-                    service: order.type,
-                    tariff_code: order.tariff_code,
-                },
-            });
-
-            logger.info('[order.accept] Notif customer terkirim', {
-                orderId,
-                driverId,
-            });
-        } catch (err: any) {
-            logger.warn('[order.accept] Gagal kirim notif ke customer', {
-                orderId,
-                error: err.message,
-            });
-        }
-
-        await orderService.notifyMerchantDriverAssigned(
-            order,
-            firstName(driverProfile?.full_name)
-        );
-
-        void adminOrderNotify.driverAssigned(order, driverId);
+        // 🆕 Semua efek setelah diterima (bids, penawaran nego, status driver, notif)
+        await orderService.afterAccepted(order, driverId);
 
         return data;
     },
@@ -1874,6 +1896,16 @@ export const orderService = {
         if (status === 'cancelled' && !order.driver_id) {
             await supabaseAdmin
                 .from('order_bids')
+                .update({
+                    status: 'expired',
+                    responded_at: new Date().toISOString(),
+                })
+                .eq('order_id', orderId)
+                .eq('status', 'pending');
+
+            // 🆕 penawaran nego yang masih menggantung ikut ditutup
+            await supabaseAdmin
+                .from('order_offers')
                 .update({
                     status: 'expired',
                     responded_at: new Date().toISOString(),
